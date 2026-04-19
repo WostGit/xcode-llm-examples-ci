@@ -1,13 +1,13 @@
-name: Progressive Xcode LLM Test Suite
+name: Xcode LLM 6h Exhaustive CI
 
 on:
   workflow_dispatch:
   push:
     paths:
-      - ".github/workflows/progressive-xcode-llm-suite.yml"
+      - ".github/workflows/xcode-llm-6h-exhaustive.yml"
   pull_request:
     paths:
-      - ".github/workflows/progressive-xcode-llm-suite.yml"
+      - ".github/workflows/xcode-llm-6h-exhaustive.yml"
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -17,42 +17,19 @@ env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
-  progressive-suite:
+  discover:
+    name: Discover repos, schemes, and destinations
     runs-on: macos-15
-    timeout-minutes: 120
-
+    timeout-minutes: 45
+    outputs:
+      manifest_json: ${{ steps.emit.outputs.manifest_json }}
+      matrix_json: ${{ steps.emit.outputs.matrix_json }}
     env:
       DEVELOPER_DIR: /Applications/Xcode_16.3.app/Contents/Developer
       NSUnbufferedIO: YES
-      CI_ULTRA_VERBOSE: "1"
-
     steps:
-      - name: Checkout repository
+      - name: Checkout workflow repo
         uses: actions/checkout@v4
-
-      - name: Show toolchain and runner info
-        shell: bash
-        run: |
-          set -euxo pipefail
-
-          echo "::group::toolchain"
-          xcode-select -p
-          xcodebuild -version
-          swift --version
-          echo "::endgroup::"
-
-          echo "::group::simulator runtimes"
-          xcrun simctl list runtimes || true
-          echo "::endgroup::"
-
-          echo "::group::simulator devices"
-          xcrun simctl list devices available || true
-          echo "::endgroup::"
-
-          echo "::group::workspace tree"
-          pwd
-          ls -la
-          echo "::endgroup::"
 
       - name: Restore SwiftPM cache
         uses: actions/cache@v4
@@ -60,17 +37,35 @@ jobs:
           path: |
             ~/.swiftpm
             ~/Library/Caches/org.swift.swiftpm
-          key: ${{ runner.os }}-progressive-xcode-16_3-${{ hashFiles('**/Package.resolved', '**/project.yml') }}
+          key: ${{ runner.os }}-xcode-llm-6h-${{ hashFiles('**/Package.resolved', '**/project.yml') }}
           restore-keys: |
-            ${{ runner.os }}-progressive-xcode-16_3-
+            ${{ runner.os }}-xcode-llm-6h-
 
-      - name: Create CI folders
+      - name: Prepare workspace
         shell: bash
         run: |
           set -euxo pipefail
-          mkdir -p ci/repos ci/results/logs
+          mkdir -p ci/repos ci/out ci/logs
 
-      - name: Clone target repositories
+      - name: Show toolchain
+        shell: bash
+        run: |
+          set -euxo pipefail
+          echo "::group::toolchain"
+          xcode-select -p
+          xcodebuild -version
+          swift --version
+          echo "::endgroup::"
+
+          echo "::group::sim runtimes"
+          xcrun simctl list runtimes || true
+          echo "::endgroup::"
+
+          echo "::group::sim devices"
+          xcrun simctl list devices available || true
+          echo "::endgroup::"
+
+      - name: Clone target repos
         shell: bash
         run: |
           set -euxo pipefail
@@ -79,10 +74,7 @@ jobs:
             local url="$1"
             local ref="$2"
             local dir="$3"
-            echo "Cloning $url @ $ref into ci/repos/$dir"
             git clone --depth 1 --branch "$ref" "$url" "ci/repos/$dir"
-            echo "Finished clone for $dir"
-            ls -la "ci/repos/$dir"
           }
 
           clone_repo https://github.com/huggingface/AnyLanguageModel.git main AnyLanguageModel
@@ -94,108 +86,11 @@ jobs:
         shell: bash
         run: |
           set -euxo pipefail
+          brew install xcodegen || true
+          xcodegen version || true
 
-          if [ -f "ci/repos/BisonAI-iOS/project.yml" ]; then
-            brew install xcodegen
-            xcodegen version
-          fi
-
-      - name: Discover targets and print execution plan
-        shell: bash
-        run: |
-          set -euxo pipefail
-
-          python3 <<'PY'
-          import json
-          from pathlib import Path
-
-          root = Path("ci/repos")
-          results_dir = Path("ci/results")
-          results_dir.mkdir(parents=True, exist_ok=True)
-
-          targets = []
-
-          def add(item):
-              targets.append(item)
-
-          for repo in sorted(root.iterdir()):
-              if not repo.is_dir():
-                  continue
-
-              repo_name = repo.name
-
-              if repo_name == "AnyLanguageModel" and (repo / "Package.swift").exists():
-                  add({
-                      "name": "AnyLanguageModel",
-                      "repo_path": str(repo),
-                      "kind": "swiftpm",
-                      "weight": 10,
-                      "steps": ["resolve", "build", "test"]
-                  })
-
-              if repo_name == "mlx-swift-examples":
-                  project = repo / "mlx-swift-examples.xcodeproj"
-                  if project.exists():
-                      add({
-                          "name": "mlx-swift-examples :: LLMBasic",
-                          "repo_path": str(repo),
-                          "kind": "mlx_macos_scheme",
-                          "project_path": str(project),
-                          "scheme": "LLMBasic",
-                          "weight": 20,
-                          "steps": ["macos_build"]
-                      })
-                      add({
-                          "name": "mlx-swift-examples :: LLMEval",
-                          "repo_path": str(repo),
-                          "kind": "mlx_macos_scheme",
-                          "project_path": str(project),
-                          "scheme": "LLMEval",
-                          "weight": 21,
-                          "steps": ["macos_build"]
-                      })
-
-              if repo_name == "BisonAI-iOS":
-                  add({
-                      "name": "BisonAI-iOS",
-                      "repo_path": str(repo),
-                      "kind": "bisonai_xcodegen",
-                      "weight": 70,
-                      "steps": ["generate", "ios_build", "ios_test"]
-                  })
-
-              if repo_name == "llama.cpp":
-                  add({
-                      "name": "llama.cpp :: llama.swiftui",
-                      "repo_path": str(repo),
-                      "kind": "llama_swiftui",
-                      "weight": 90,
-                      "steps": ["bootstrap_xcframework", "ios_build"]
-                  })
-
-          targets = sorted(targets, key=lambda x: (x["weight"], x["name"]))
-
-          payload = {"targets": targets}
-          manifest_path = results_dir / "manifest.json"
-          manifest_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-
-          print("====================================================================================================", flush=True)
-          print("[SUITE] DISCOVERED TARGET MANIFEST", flush=True)
-          print("====================================================================================================", flush=True)
-          print(manifest_path.read_text(encoding="utf-8"), flush=True)
-
-          print("====================================================================================================", flush=True)
-          print("[SUITE] EXECUTION ORDER", flush=True)
-          print("====================================================================================================", flush=True)
-          for idx, t in enumerate(targets, start=1):
-              print(f"[SUITE] {idx}/{len(targets)} :: {t['name']} :: kind={t['kind']} :: steps={','.join(t['steps'])}", flush=True)
-
-          if not targets:
-              print("[FAIL] No targets discovered.", flush=True)
-              raise SystemExit(1)
-          PY
-
-      - name: Run progressive suite with incremental ultra verbose pass fail
+      - name: Discover targets and destinations
+        id: emit
         shell: bash
         run: |
           set -euxo pipefail
@@ -203,465 +98,702 @@ jobs:
           python3 <<'PY'
           import json
           import os
+          import re
           import subprocess
-          import time
           from pathlib import Path
 
-          MANIFEST = Path("ci/results/manifest.json")
-          RESULTS_DIR = Path("ci/results")
-          LOGS_DIR = RESULTS_DIR / "logs"
-          LOGS_DIR.mkdir(parents=True, exist_ok=True)
-          STEP_SUMMARY = os.environ.get("GITHUB_STEP_SUMMARY")
+          root = Path("ci/repos")
+          out_dir = Path("ci/out")
+          out_dir.mkdir(parents=True, exist_ok=True)
 
-          def now():
-              return time.strftime("%Y-%m-%d %H:%M:%S")
+          def sh(cmd, cwd=None):
+              p = subprocess.run(cmd, cwd=cwd, text=True, capture_output=True)
+              return p.returncode, p.stdout, p.stderr
 
-          def bar(ch="=", n=100):
-              return ch * n
-
-          def banner(title):
-              print(bar("="), flush=True)
-              print(title, flush=True)
-              print(bar("="), flush=True)
-
-          def subbanner(title):
-              print(bar("-"), flush=True)
-              print(title, flush=True)
-              print(bar("-"), flush=True)
-
-          def info(msg):
-              print(f"[INFO] {msg}", flush=True)
-
-          def suite(msg):
-              print(f"[SUITE] {msg}", flush=True)
-
-          def target(msg):
-              print(f"[TARGET] {msg}", flush=True)
-
-          def step(msg):
-              print(f"[STEP] {msg}", flush=True)
-
-          def cmd(msg):
-              print(f"[CMD] {msg}", flush=True)
-
-          def passed(msg):
-              print(f"[PASS] {msg}", flush=True)
-
-          def failed(msg):
-              print(f"[FAIL] {msg}", flush=True)
-
-          def skipped(msg):
-              print(f"[SKIP] {msg}", flush=True)
-
-          def checkpoint(msg):
-              print(f"[CHECKPOINT] {msg}", flush=True)
-
-          def totals(msg):
-              print(f"[TOTALS] {msg}", flush=True)
-
-          def write_text(path, text):
-              path = Path(path)
-              path.parent.mkdir(parents=True, exist_ok=True)
-              path.write_text(text, encoding="utf-8")
-
-          def append_text(path, text):
-              with open(path, "a", encoding="utf-8") as f:
-                  f.write(text)
-
-          def top_lines(text, limit=12):
-              hits = []
-              for line in text.splitlines():
-                  low = line.lower()
-                  if any(token in low for token in [
-                      "error:",
-                      " fatal",
-                      "failed",
-                      "test failed",
-                      "no such module",
-                      "codesign",
-                      "signing",
-                      "unable to",
-                      "unsupported",
-                      "warning:",
-                      "xcodebuild:"
-                  ]):
-                      hits.append(line.rstrip())
-              return hits[:limit]
-
-          def first_available_iphone_sim():
-              try:
-                  out = subprocess.check_output(
-                      ["xcrun", "simctl", "list", "devices", "available"],
-                      text=True
-                  )
-              except Exception:
-                  return "platform=iOS Simulator,name=iPhone 16"
-
-              preferred = []
-              for line in out.splitlines():
+          def parse_destinations(text):
+              items = []
+              current_section = None
+              for raw in text.splitlines():
+                  line = raw.rstrip()
+                  if "Available destinations for the" in line:
+                      current_section = "available"
+                      continue
+                  if "Ineligible destinations for the" in line:
+                      current_section = "ineligible"
+                      continue
                   s = line.strip()
-                  if "iPhone" in s and "(" in s and ")" in s:
-                      name = s.split("(")[0].strip()
-                      if name:
-                          preferred.append(name)
+                  if not s.startswith("{") or not s.endswith("}"):
+                      continue
+                  body = s[1:-1]
+                  pairs = {}
+                  for part in body.split(", "):
+                      if ":" in part:
+                          k, v = part.split(":", 1)
+                          pairs[k.strip()] = v.strip()
+                  pairs["_section"] = current_section
+                  items.append(pairs)
+              return items
 
-              for wanted in [
-                  "iPhone 16 Pro",
-                  "iPhone 16",
-                  "iPhone 15 Pro",
-                  "iPhone 15",
-                  "iPhone 14 Pro",
-                  "iPhone 14"
-              ]:
-                  if wanted in preferred:
-                      return f"platform=iOS Simulator,name={wanted}"
+          targets = []
 
-              if preferred:
-                  return f"platform=iOS Simulator,name={preferred[0]}"
+          # AnyLanguageModel: SwiftPM
+          repo = root / "AnyLanguageModel"
+          if (repo / "Package.swift").exists():
+              targets.append({
+                  "name": "AnyLanguageModel",
+                  "repo_path": str(repo),
+                  "kind": "swiftpm",
+                  "weight": 10,
+                  "steps": ["resolve", "build", "test", "traits_coreml", "traits_mlx", "traits_llama"],
+              })
 
-              return "platform=iOS Simulator,name=iPhone 16"
+          # mlx-swift-examples: explicit schemes
+          repo = root / "mlx-swift-examples"
+          proj = repo / "mlx-swift-examples.xcodeproj"
+          if proj.exists():
+              for idx, scheme in enumerate(["LLMBasic", "LLMEval", "MLXChatExample"], start=20):
+                  rc, out, err = sh(
+                      ["xcodebuild", "-project", str(proj.name), "-scheme", scheme, "-showdestinations"],
+                      cwd=repo
+                  )
+                  dests = parse_destinations(out + "\n" + err)
+                  targets.append({
+                      "name": f"mlx-swift-examples :: {scheme}",
+                      "repo_path": str(repo),
+                      "kind": "xcode_scheme",
+                      "project": proj.name,
+                      "scheme": scheme,
+                      "destinations": dests,
+                      "weight": idx,
+                      "steps": ["showdestinations", "build_eligible"],
+                  })
 
-          def run_cmd(step_name, step_idx, step_total, cmd_list, cwd, log_path):
-              step(f"START {step_idx}/{step_total} :: {step_name}")
-              cmd(f"WORKDIR={cwd}")
-              cmd("COMMAND=" + " ".join(cmd_list))
-              cmd(f"LOG={log_path}")
-              cmd(f"STARTED_AT={now()}")
+          # BisonAI: generate then inspect
+          repo = root / "BisonAI-iOS"
+          if (repo / "project.yml").exists():
+              sh(["xcodegen", "generate"], cwd=repo)
+              proj = repo / "BisonAI.xcodeproj"
+              dests = []
+              if proj.exists():
+                  rc, out, err = sh(
+                      ["xcodebuild", "-project", proj.name, "-scheme", "BisonAI", "-showdestinations"],
+                      cwd=repo
+                  )
+                  dests = parse_destinations(out + "\n" + err)
+              targets.append({
+                  "name": "BisonAI-iOS",
+                  "repo_path": str(repo),
+                  "kind": "bisonai_xcodegen",
+                  "project": "BisonAI.xcodeproj",
+                  "scheme": "BisonAI",
+                  "destinations": dests,
+                  "weight": 70,
+                  "steps": ["generate", "showdestinations", "build_eligible", "test_eligible"],
+              })
 
-              started = time.time()
-              proc = subprocess.Popen(
-                  cmd_list,
-                  cwd=cwd,
-                  stdout=subprocess.PIPE,
-                  stderr=subprocess.STDOUT,
-                  text=True,
-                  bufsize=1,
+          # llama.cpp heavy
+          repo = root / "llama.cpp"
+          swiftui_proj = repo / "examples" / "llama.swiftui" / "llama.swiftui.xcodeproj"
+          targets.append({
+              "name": "llama.cpp :: bootstrap_xcframework",
+              "repo_path": str(repo),
+              "kind": "llama_bootstrap",
+              "weight": 90,
+              "steps": ["bootstrap_xcframework"],
+          })
+          if swiftui_proj.exists():
+              rc, out, err = sh(
+                  ["xcodebuild", "-project", str(swiftui_proj.relative_to(repo)), "-scheme", "llama.swiftui", "-showdestinations"],
+                  cwd=repo
               )
+              dests = parse_destinations(out + "\n" + err)
+              targets.append({
+                  "name": "llama.cpp :: llama.swiftui",
+                  "repo_path": str(repo),
+                  "kind": "llama_swiftui",
+                  "project": str(swiftui_proj.relative_to(repo)),
+                  "scheme": "llama.swiftui",
+                  "destinations": dests,
+                  "weight": 100,
+                  "steps": ["showdestinations", "build_eligible"],
+              })
 
-              lines = []
-              with open(log_path, "w", encoding="utf-8") as logf:
-                  assert proc.stdout is not None
-                  for line in proc.stdout:
-                      print(line, end="", flush=True)
-                      logf.write(line)
-                      lines.append(line)
+          targets = sorted(targets, key=lambda x: (x["weight"], x["name"]))
 
-              rc = proc.wait()
-              elapsed = round(time.time() - started, 2)
-              output = "".join(lines)
-              key_lines = top_lines(output)
+          manifest = {"targets": targets}
+          (out_dir / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
 
-              if rc == 0:
-                  passed(f"{step_name} :: {elapsed:.2f}s")
-              else:
-                  failed(f"{step_name} :: {elapsed:.2f}s")
-                  if key_lines:
-                      failed("top diagnostic lines begin")
-                      for k in key_lines:
-                          failed(k)
-                      failed("top diagnostic lines end")
-
-              return {
-                  "returncode": rc,
-                  "seconds": elapsed,
-                  "output": output,
-                  "key_lines": key_lines,
-              }
-
-          def mark_skip(record, step_name, reason):
-              record["skipped_steps"].append(step_name)
-              skipped(f"{step_name} :: because {reason}")
-
-          manifest = json.loads(MANIFEST.read_text(encoding="utf-8"))
-          targets = manifest["targets"]
-
-          sim_dest = first_available_iphone_sim()
-          suite(f"Using simulator destination: {sim_dest}")
-
-          results = []
-          passed_targets = 0
-          failed_targets = 0
-
-          for idx, t in enumerate(targets, start=1):
-              name = t["name"]
-              kind = t["kind"]
-              repo_path = t["repo_path"]
-              declared_steps = list(t["steps"])
-              safe_name = name.replace("/", "_").replace(":", "_").replace(" ", "_")
-
-              banner(f"[TARGET] START {idx}/{len(targets)} :: {name} :: kind={kind}")
-              info(f"TARGET_PAYLOAD={json.dumps(t, indent=2)}")
-              info(f"DECLARED_STEPS={declared_steps}")
-
-              record = {
-                  "name": name,
-                  "kind": kind,
-                  "status": "passed",
-                  "failed_step": None,
-                  "completed_steps": [],
-                  "skipped_steps": [],
-                  "step_results": [],
-                  "top_issue": "",
-                  "seconds": 0.0
-              }
-
-              target_started = time.time()
-
-              def mark_fail(step_name, result):
-                  record["status"] = "failed"
-                  record["failed_step"] = step_name
-                  keys = result.get("key_lines") or []
-                  record["top_issue"] = keys[0] if keys else "Unknown failure"
-
-              def add_step_result(step_name, result=None, status=None, reason=None, log_path=None):
-                  item = {
-                      "step": step_name,
-                      "status": status,
-                      "seconds": None if result is None else result.get("seconds"),
-                      "log_path": None if log_path is None else str(log_path),
-                      "top_lines": [] if result is None else result.get("key_lines", []),
-                      "reason": reason,
+          # execution matrix: one row per target, build logic determines destination loops internally
+          matrix = {
+              "include": [
+                  {
+                      "name": t["name"],
+                      "repo_path": t["repo_path"],
+                      "kind": t["kind"],
                   }
-                  record["step_results"].append(item)
+                  for t in targets
+              ]
+          }
+          (out_dir / "matrix.json").write_text(json.dumps(matrix, indent=2), encoding="utf-8")
 
-              def run_step(step_name, step_idx, step_total, cmd_list, cwd, log_path):
-                  result = run_cmd(step_name, step_idx, step_total, cmd_list, cwd, log_path)
-                  if result["returncode"] == 0:
-                      record["completed_steps"].append(step_name)
-                      add_step_result(step_name, result=result, status="passed", log_path=log_path)
-                  else:
-                      mark_fail(step_name, result)
-                      add_step_result(step_name, result=result, status="failed", log_path=log_path)
-                  checkpoint(
-                      f"target={name} status={record['status']} "
-                      f"completed={','.join(record['completed_steps']) or '-'} "
-                      f"failed_step={record['failed_step'] or '-'} "
-                      f"skipped={','.join(record['skipped_steps']) or '-'}"
-                  )
-                  return result
+          print("::group::manifest.json")
+          print((out_dir / "manifest.json").read_text(encoding="utf-8"))
+          print("::endgroup::")
+          print("::group::matrix.json")
+          print((out_dir / "matrix.json").read_text(encoding="utf-8"))
+          print("::endgroup::")
 
-              if kind == "swiftpm":
-                  r = run_step(
-                      "resolve", 1, 3,
-                      ["swift", "package", "resolve"],
-                      repo_path,
-                      LOGS_DIR / f"{idx:02d}-{safe_name}-resolve.log"
-                  )
-
-                  if record["status"] == "passed":
-                      r = run_step(
-                          "build", 2, 3,
-                          ["swift", "build"],
-                          repo_path,
-                          LOGS_DIR / f"{idx:02d}-{safe_name}-build.log"
-                      )
-                  else:
-                      mark_skip(record, "build", "previous step failed")
-                      add_step_result("build", status="skipped", reason="previous step failed")
-
-                  if record["status"] == "passed":
-                      r = run_step(
-                          "test", 3, 3,
-                          ["swift", "test"],
-                          repo_path,
-                          LOGS_DIR / f"{idx:02d}-{safe_name}-test.log"
-                      )
-                  else:
-                      mark_skip(record, "test", "previous step failed")
-                      add_step_result("test", status="skipped", reason="previous step failed")
-
-              elif kind == "mlx_macos_scheme":
-                  run_step(
-                      f"macos_build({t['scheme']})", 1, 1,
-                      [
-                          "xcodebuild",
-                          "-project", t["project_path"],
-                          "-scheme", t["scheme"],
-                          "-destination", "platform=macOS",
-                          "-derivedDataPath", "DerivedData",
-                          "CODE_SIGNING_ALLOWED=NO",
-                          "build",
-                      ],
-                      repo_path,
-                      LOGS_DIR / f"{idx:02d}-{safe_name}-macos-build.log"
-                  )
-
-              elif kind == "bisonai_xcodegen":
-                  run_step(
-                      "generate", 1, 3,
-                      ["xcodegen", "generate"],
-                      repo_path,
-                      LOGS_DIR / f"{idx:02d}-{safe_name}-generate.log"
-                  )
-
-                  if record["status"] == "passed":
-                      run_step(
-                          "ios_build", 2, 3,
-                          [
-                              "xcodebuild",
-                              "-project", "BisonAI.xcodeproj",
-                              "-scheme", "BisonAI",
-                              "-destination", sim_dest,
-                              "-derivedDataPath", "DerivedData",
-                              "CODE_SIGNING_ALLOWED=NO",
-                              "build",
-                          ],
-                          repo_path,
-                          LOGS_DIR / f"{idx:02d}-{safe_name}-ios-build.log"
-                      )
-                  else:
-                      mark_skip(record, "ios_build", "previous step failed")
-                      add_step_result("ios_build", status="skipped", reason="previous step failed")
-
-                  if record["status"] == "passed":
-                      run_step(
-                          "ios_test", 3, 3,
-                          [
-                              "xcodebuild",
-                              "-project", "BisonAI.xcodeproj",
-                              "-scheme", "BisonAI",
-                              "-destination", sim_dest,
-                              "-derivedDataPath", "DerivedData",
-                              "CODE_SIGNING_ALLOWED=NO",
-                              "test",
-                          ],
-                          repo_path,
-                          LOGS_DIR / f"{idx:02d}-{safe_name}-ios-test.log"
-                      )
-                  else:
-                      mark_skip(record, "ios_test", "previous step failed")
-                      add_step_result("ios_test", status="skipped", reason="previous step failed")
-
-              elif kind == "llama_swiftui":
-                  run_step(
-                      "bootstrap_xcframework", 1, 2,
-                      ["./build-xcframework.sh"],
-                      repo_path,
-                      LOGS_DIR / f"{idx:02d}-{safe_name}-bootstrap.log"
-                  )
-
-                  if record["status"] == "passed":
-                      run_step(
-                          "ios_build", 2, 2,
-                          [
-                              "xcodebuild",
-                              "-project", "examples/llama.swiftui/llama.swiftui.xcodeproj",
-                              "-scheme", "llama.swiftui",
-                              "-destination", sim_dest,
-                              "-derivedDataPath", "DerivedData",
-                              "CODE_SIGNING_ALLOWED=NO",
-                              "build",
-                          ],
-                          repo_path,
-                          LOGS_DIR / f"{idx:02d}-{safe_name}-ios-build.log"
-                      )
-                  else:
-                      mark_skip(record, "ios_build", "previous step failed")
-                      add_step_result("ios_build", status="skipped", reason="previous step failed")
-
-              else:
-                  record["status"] = "failed"
-                  record["failed_step"] = "unknown_kind"
-                  record["top_issue"] = f"Unknown kind: {kind}"
-                  failed(f"Unknown target kind: {kind}")
-                  add_step_result("unknown_kind", status="failed", reason=f"Unknown kind: {kind}")
-
-              record["seconds"] = round(time.time() - target_started, 2)
-
-              if record["status"] == "passed":
-                  passed_targets += 1
-                  target(
-                      f"END :: PASS :: completed={record['completed_steps']} "
-                      f"skipped={record['skipped_steps']} elapsed={record['seconds']:.2f}s"
-                  )
-              else:
-                  failed_targets += 1
-                  target(
-                      f"END :: FAIL :: failed_step={record['failed_step']} "
-                      f"completed={record['completed_steps']} skipped={record['skipped_steps']} "
-                      f"elapsed={record['seconds']:.2f}s"
-                  )
-                  if record["top_issue"]:
-                      failed(f"top issue :: {record['top_issue']}")
-
-              results.append(record)
-
-              totals(
-                  f"after {idx}/{len(targets)} targets :: "
-                  f"passed={passed_targets} failed={failed_targets} remaining={len(targets)-idx}"
-              )
-
-          summary_lines = []
-          summary_lines.append("# Progressive Xcode LLM Test Summary")
-          summary_lines.append("")
-          summary_lines.append(f"- Total targets: **{len(results)}**")
-          summary_lines.append(f"- Passed: **{passed_targets}**")
-          summary_lines.append(f"- Failed: **{failed_targets}**")
-          summary_lines.append("")
-          summary_lines.append("| Target | Kind | Status | Failed step | Completed steps | Skipped steps | Seconds | Top issue |")
-          summary_lines.append("|---|---|---|---|---|---|---:|---|")
-
-          for r in results:
-              summary_lines.append(
-                  f"| {r['name']} | {r['kind']} | {r['status']} | {r['failed_step'] or ''} | "
-                  f"{', '.join(r['completed_steps'])} | {', '.join(r['skipped_steps'])} | "
-                  f"{r['seconds']:.2f} | {r['top_issue'].replace('|', '/')} |"
-              )
-
-          summary_md = "\n".join(summary_lines) + "\n"
-          summary_json = json.dumps(results, indent=2)
-
-          write_text(RESULTS_DIR / "summary.md", summary_md)
-          write_text(RESULTS_DIR / "summary.json", summary_json)
-
-          banner("[SUMMARY] FINAL MARKDOWN SUMMARY")
-          print(summary_md, flush=True)
-
-          banner("[SUMMARY] FINAL JSON SUMMARY")
-          print(summary_json, flush=True)
-
-          if STEP_SUMMARY:
-              append_text(STEP_SUMMARY, summary_md)
-
-          raise SystemExit(1 if failed_targets else 0)
+          github_output = os.environ["GITHUB_OUTPUT"]
+          with open(github_output, "a", encoding="utf-8") as f:
+              f.write("manifest_json<<EOF\n")
+              f.write((out_dir / "manifest.json").read_text(encoding="utf-8"))
+              f.write("\nEOF\n")
+              f.write("matrix_json<<EOF\n")
+              f.write((out_dir / "matrix.json").read_text(encoding="utf-8"))
+              f.write("\nEOF\n")
           PY
 
-      - name: Print generated result files to console
+      - name: Upload discovery artifacts
         if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: discovery-artifacts
+          path: ci/out
+          if-no-files-found: ignore
+
+  lane-smoke:
+    name: Smoke / SwiftPM / Fast confidence
+    needs: discover
+    runs-on: macos-15
+    timeout-minutes: 90
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_16.3.app/Contents/Developer
+      NSUnbufferedIO: YES
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Restore SwiftPM cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.swiftpm
+            ~/Library/Caches/org.swift.swiftpm
+          key: ${{ runner.os }}-xcode-llm-6h-smoke-${{ hashFiles('**/Package.resolved') }}
+          restore-keys: |
+            ${{ runner.os }}-xcode-llm-6h-smoke-
+            ${{ runner.os }}-xcode-llm-6h-
+
+      - name: Prepare
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p ci/repos ci/results/logs
+
+      - name: Clone AnyLanguageModel
+        shell: bash
+        run: |
+          set -euxo pipefail
+          git clone --depth 1 --branch main https://github.com/huggingface/AnyLanguageModel.git ci/repos/AnyLanguageModel
+
+      - name: Run AnyLanguageModel exhaustive SwiftPM lane
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cd ci/repos/AnyLanguageModel
+
+          echo "::group::swift package resolve"
+          swift package resolve 2>&1 | tee ../../results/logs/01-resolve.log
+          echo "::endgroup::"
+
+          echo "::group::swift build"
+          swift build 2>&1 | tee ../../results/logs/02-build.log
+          echo "::endgroup::"
+
+          echo "::group::swift test"
+          swift test 2>&1 | tee ../../results/logs/03-test.log
+          echo "::endgroup::"
+
+          echo "::group::swift build --traits CoreML"
+          swift build --traits CoreML 2>&1 | tee ../../results/logs/04-build-coreml.log
+          echo "::endgroup::"
+
+          echo "::group::swift build --traits MLX"
+          swift build --traits MLX 2>&1 | tee ../../results/logs/05-build-mlx.log
+          echo "::endgroup::"
+
+          echo "::group::swift build --traits Llama"
+          swift build --traits Llama 2>&1 | tee ../../results/logs/06-build-llama.log
+          echo "::endgroup::"
+
+      - name: Upload smoke artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: smoke-results
+          path: ci/results
+          if-no-files-found: ignore
+
+  lane-xcode:
+    name: Xcode examples / scheme-aware builds
+    needs: discover
+    runs-on: macos-15
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        include:
+          - repo: mlx-swift-examples
+            clone_url: https://github.com/ml-explore/mlx-swift-examples.git
+            ref: main
+            kind: mlx
+          - repo: BisonAI-iOS
+            clone_url: https://github.com/bisonbet/BisonAI-iOS.git
+            ref: main
+            kind: bison
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_16.3.app/Contents/Developer
+      NSUnbufferedIO: YES
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Restore SwiftPM cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.swiftpm
+            ~/Library/Caches/org.swift.swiftpm
+          key: ${{ runner.os }}-xcode-llm-6h-xcode-${{ matrix.repo }}
+          restore-keys: |
+            ${{ runner.os }}-xcode-llm-6h-xcode-
+            ${{ runner.os }}-xcode-llm-6h-
+
+      - name: Prepare
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p ci/repos ci/results/logs
+
+      - name: Clone target repo
+        shell: bash
+        run: |
+          set -euxo pipefail
+          git clone --depth 1 --branch "${{ matrix.ref }}" "${{ matrix.clone_url }}" "ci/repos/${{ matrix.repo }}"
+
+      - name: Install xcodegen for BisonAI
+        if: matrix.kind == 'bison'
+        shell: bash
+        run: |
+          set -euxo pipefail
+          brew install xcodegen || true
+          xcodegen version
+
+      - name: Run scheme-aware build plan
         shell: bash
         run: |
           set -euxo pipefail
 
-          echo "::group::result directory tree"
-          find ci/results -maxdepth 3 -type f | sort
-          echo "::endgroup::"
+          python3 <<'PY'
+          import json
+          import subprocess
+          from pathlib import Path
 
-          echo "::group::manifest.json"
-          [ -f ci/results/manifest.json ] && cat ci/results/manifest.json || true
-          echo "::endgroup::"
+          repo_kind = "${{ matrix.kind }}"
+          repo_name = "${{ matrix.repo }}"
+          repo = Path("ci/repos") / repo_name
+          out = Path("ci/results")
+          logs = out / "logs"
+          out.mkdir(parents=True, exist_ok=True)
+          logs.mkdir(parents=True, exist_ok=True)
 
-          echo "::group::summary.md"
-          [ -f ci/results/summary.md ] && cat ci/results/summary.md || true
-          echo "::endgroup::"
+          def run(name, cmd, cwd):
+              print("=" * 100, flush=True)
+              print(f"[STEP] {name}", flush=True)
+              print("COMMAND:", " ".join(cmd), flush=True)
+              print("CWD:", cwd, flush=True)
+              print("=" * 100, flush=True)
+              p = subprocess.Popen(cmd, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
+              log_path = logs / f"{name}.log"
+              with open(log_path, "w", encoding="utf-8") as f:
+                  assert p.stdout is not None
+                  for line in p.stdout:
+                      print(line, end="", flush=True)
+                      f.write(line)
+              rc = p.wait()
+              print(f"[RESULT] {name} rc={rc}", flush=True)
+              return rc
 
-          echo "::group::summary.json"
-          [ -f ci/results/summary.json ] && cat ci/results/summary.json || true
-          echo "::endgroup::"
+          def capture(cmd, cwd):
+              p = subprocess.run(cmd, cwd=cwd, text=True, capture_output=True)
+              return p.returncode, p.stdout + "\n" + p.stderr
 
-          echo "::group::tail of all log files"
-          if [ -d ci/results/logs ]; then
-            find ci/results/logs -type f | sort | while read -r f; do
-              echo "===== LOG FILE: $f ====="
-              tail -n 80 "$f" || true
-              echo
-            done
-          fi
-          echo "::endgroup::"
+          def parse_destinations(text):
+              items = []
+              current = None
+              for raw in text.splitlines():
+                  line = raw.rstrip()
+                  if "Available destinations for the" in line:
+                      current = "available"
+                      continue
+                  if "Ineligible destinations for the" in line:
+                      current = "ineligible"
+                      continue
+                  s = line.strip()
+                  if not (s.startswith("{") and s.endswith("}")):
+                      continue
+                  body = s[1:-1]
+                  fields = {}
+                  for part in body.split(", "):
+                      if ":" in part:
+                          k, v = part.split(":", 1)
+                          fields[k.strip()] = v.strip()
+                  fields["_section"] = current
+                  items.append(fields)
+              return items
 
-      - name: Upload suite artifacts
+          def build_scheme(project, scheme):
+              rc, txt = capture(["xcodebuild", "-project", project, "-scheme", scheme, "-showdestinations"], repo)
+              print(txt, flush=True)
+              dests = parse_destinations(txt)
+
+              available = [d for d in dests if d.get("_section") == "available"]
+
+              # prefer macOS first, then iOS simulator, then visionOS simulator
+              selected = []
+              seen = set()
+              for d in available:
+                  plat = d.get("platform", "")
+                  name = d.get("name", "")
+                  osver = d.get("OS", "latest")
+                  if plat == "macOS":
+                      spec = "platform=macOS"
+                  elif plat == "iOS Simulator":
+                      spec = f"platform=iOS Simulator,name={name}"
+                      if osver and osver != "latest":
+                          spec += f",OS={osver}"
+                  elif plat == "visionOS Simulator":
+                      spec = f"platform=visionOS Simulator,name={name}"
+                      if osver and osver != "latest":
+                          spec += f",OS={osver}"
+                  else:
+                      continue
+                  if spec not in seen:
+                      seen.add(spec)
+                      selected.append(spec)
+
+              results = []
+              for idx, dest in enumerate(selected[:4], start=1):
+                  step_name = f"{scheme}-build-{idx}"
+                  rc = run(
+                      step_name,
+                      [
+                          "xcodebuild",
+                          "-project", project,
+                          "-scheme", scheme,
+                          "-destination", dest,
+                          "-derivedDataPath", "DerivedData",
+                          "CODE_SIGNING_ALLOWED=NO",
+                          "build",
+                      ],
+                      repo
+                  )
+                  results.append({"destination": dest, "rc": rc})
+
+              return results
+
+          summary = []
+
+          if repo_kind == "mlx":
+              project = "mlx-swift-examples.xcodeproj"
+              for scheme in ["LLMBasic", "LLMEval", "MLXChatExample"]:
+                  summary.append({
+                      "scheme": scheme,
+                      "results": build_scheme(project, scheme),
+                  })
+
+          elif repo_kind == "bison":
+              run("xcodegen-generate", ["xcodegen", "generate"], repo)
+              summary.append({
+                  "scheme": "BisonAI",
+                  "results": build_scheme("BisonAI.xcodeproj", "BisonAI"),
+              })
+
+          (out / f"{repo_name}-summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
+          print(json.dumps(summary, indent=2), flush=True)
+          PY
+
+      - name: Upload xcode lane artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: progressive-xcode-llm-results
+          name: xcode-results-${{ matrix.repo }}
           path: ci/results
           if-no-files-found: ignore
+
+  lane-heavy-llama:
+    name: Heavy native backend / llama.cpp
+    needs: discover
+    runs-on: macos-15
+    timeout-minutes: 240
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_16.3.app/Contents/Developer
+      NSUnbufferedIO: YES
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Restore SwiftPM cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.swiftpm
+            ~/Library/Caches/org.swift.swiftpm
+          key: ${{ runner.os }}-xcode-llm-6h-llama
+          restore-keys: |
+            ${{ runner.os }}-xcode-llm-6h-llama
+            ${{ runner.os }}-xcode-llm-6h-
+
+      - name: Prepare
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p ci/repos ci/results/logs
+
+      - name: Clone llama.cpp
+        shell: bash
+        run: |
+          set -euxo pipefail
+          git clone --depth 1 --branch master https://github.com/ggml-org/llama.cpp.git ci/repos/llama.cpp
+
+      - name: Build XCFramework and scheme-aware app build
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          python3 <<'PY'
+          import json
+          import subprocess
+          from pathlib import Path
+
+          repo = Path("ci/repos/llama.cpp")
+          out = Path("ci/results")
+          logs = out / "logs"
+          out.mkdir(parents=True, exist_ok=True)
+          logs.mkdir(parents=True, exist_ok=True)
+
+          def run(name, cmd, cwd):
+              print("=" * 120, flush=True)
+              print(f"[STEP] {name}", flush=True)
+              print("COMMAND:", " ".join(cmd), flush=True)
+              print("CWD:", cwd, flush=True)
+              print("=" * 120, flush=True)
+              p = subprocess.Popen(cmd, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
+              log_path = logs / f"{name}.log"
+              with open(log_path, "w", encoding="utf-8") as f:
+                  assert p.stdout is not None
+                  for line in p.stdout:
+                      print(line, end="", flush=True)
+                      f.write(line)
+              rc = p.wait()
+              print(f"[RESULT] {name} rc={rc}", flush=True)
+              return rc
+
+          def capture(cmd, cwd):
+              p = subprocess.run(cmd, cwd=cwd, text=True, capture_output=True)
+              return p.returncode, p.stdout + "\n" + p.stderr
+
+          def parse_destinations(text):
+              items = []
+              current = None
+              for raw in text.splitlines():
+                  line = raw.rstrip()
+                  if "Available destinations for the" in line:
+                      current = "available"
+                      continue
+                  if "Ineligible destinations for the" in line:
+                      current = "ineligible"
+                      continue
+                  s = line.strip()
+                  if not (s.startswith("{") and s.endswith("}")):
+                      continue
+                  body = s[1:-1]
+                  fields = {}
+                  for part in body.split(", "):
+                      if ":" in part:
+                          k, v = part.split(":", 1)
+                          fields[k.strip()] = v.strip()
+                  fields["_section"] = current
+                  items.append(fields)
+              return items
+
+          summary = {"bootstrap": None, "app_builds": []}
+
+          rc = run("llama-bootstrap-xcframework", ["./build-xcframework.sh"], repo)
+          summary["bootstrap"] = {"rc": rc, "xcframework_exists": (repo / "build-apple" / "llama.xcframework").exists()}
+
+          if rc == 0:
+              project = "examples/llama.swiftui/llama.swiftui.xcodeproj"
+              scheme = "llama.swiftui"
+              _, txt = capture(["xcodebuild", "-project", project, "-scheme", scheme, "-showdestinations"], repo)
+              print(txt, flush=True)
+              dests = parse_destinations(txt)
+
+              selected = []
+              seen = set()
+              for d in dests:
+                  if d.get("_section") != "available":
+                      continue
+                  plat = d.get("platform", "")
+                  name = d.get("name", "")
+                  osver = d.get("OS", "latest")
+                  if plat == "iOS Simulator":
+                      spec = f"platform=iOS Simulator,name={name}"
+                      if osver and osver != "latest":
+                          spec += f",OS={osver}"
+                  elif plat == "visionOS Simulator":
+                      spec = f"platform=visionOS Simulator,name={name}"
+                      if osver and osver != "latest":
+                          spec += f",OS={osver}"
+                  elif plat == "macOS":
+                      spec = "platform=macOS"
+                  else:
+                      continue
+                  if spec not in seen:
+                      seen.add(spec)
+                      selected.append(spec)
+
+              for idx, dest in enumerate(selected[:4], start=1):
+                  rc2 = run(
+                      f"llama-swiftui-build-{idx}",
+                      [
+                          "xcodebuild",
+                          "-project", project,
+                          "-scheme", scheme,
+                          "-destination", dest,
+                          "-derivedDataPath", "DerivedData",
+                          "CODE_SIGNING_ALLOWED=NO",
+                          "build",
+                      ],
+                      repo
+                  )
+                  summary["app_builds"].append({"destination": dest, "rc": rc2})
+
+          (out / "llama-summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
+          print(json.dumps(summary, indent=2), flush=True)
+          PY
+
+      - name: Upload heavy lane artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: heavy-llama-results
+          path: ci/results
+          if-no-files-found: ignore
+
+  lane-repeatability:
+    name: Warm cache repeatability pass
+    needs:
+      - lane-smoke
+      - lane-xcode
+    runs-on: macos-15
+    timeout-minutes: 90
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_16.3.app/Contents/Developer
+      NSUnbufferedIO: YES
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Restore SwiftPM cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.swiftpm
+            ~/Library/Caches/org.swift.swiftpm
+          key: ${{ runner.os }}-xcode-llm-6h-repeatability
+          restore-keys: |
+            ${{ runner.os }}-xcode-llm-6h-repeatability
+            ${{ runner.os }}-xcode-llm-6h-
+
+      - name: Prepare
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p ci/repos ci/results/logs
+
+      - name: Clone repos
+        shell: bash
+        run: |
+          set -euxo pipefail
+          git clone --depth 1 --branch main https://github.com/huggingface/AnyLanguageModel.git ci/repos/AnyLanguageModel
+          git clone --depth 1 --branch main https://github.com/ml-explore/mlx-swift-examples.git ci/repos/mlx-swift-examples
+
+      - name: Warm cache rebuild
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          echo "::group::AnyLanguageModel warm build"
+          cd ci/repos/AnyLanguageModel
+          swift build 2>&1 | tee ../../results/logs/repeat-anylm-build.log
+          swift test 2>&1 | tee ../../results/logs/repeat-anylm-test.log
+          cd ../../
+          echo "::endgroup::"
+
+          echo "::group::mlx-swift-examples warm build"
+          cd ci/repos/mlx-swift-examples
+          xcodebuild -project mlx-swift-examples.xcodeproj -scheme LLMBasic -destination platform=macOS -derivedDataPath DerivedData CODE_SIGNING_ALLOWED=NO build 2>&1 | tee ../../results/logs/repeat-mlx-llmbasic.log || true
+          xcodebuild -project mlx-swift-examples.xcodeproj -scheme LLMEval -destination platform=macOS -derivedDataPath DerivedData CODE_SIGNING_ALLOWED=NO build 2>&1 | tee ../../results/logs/repeat-mlx-llmeval.log || true
+          echo "::endgroup::"
+
+      - name: Upload repeatability artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: repeatability-results
+          path: ci/results
+          if-no-files-found: ignore
+
+  summary:
+    name: Final summary
+    if: always()
+    needs:
+      - discover
+      - lane-smoke
+      - lane-xcode
+      - lane-heavy-llama
+      - lane-repeatability
+    runs-on: macos-15
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Build final markdown summary
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          echo "# Xcode LLM 6h Exhaustive CI Summary" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "Artifacts downloaded under \`artifacts/\`." >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+
+          echo "## Artifact tree" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          find artifacts -maxdepth 3 -type f | sort >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+
+          echo "::group::artifact tree"
+          find artifacts -maxdepth 4 -type f | sort
+          echo "::endgroup::"
+
+          echo "::group::json summaries"
+          find artifacts -type f \( -name '*.json' -o -name '*.md' \) | sort | while read -r f; do
+            echo "===== $f ====="
+            cat "$f" || true
+            echo
+          done
+          echo "::endgroup::"
