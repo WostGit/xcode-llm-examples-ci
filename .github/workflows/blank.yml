@@ -1,0 +1,286 @@
+name: xcode-llm-examples-ci
+
+# This workflow is intended to verify that a collection of current
+# Xcode-oriented LLM example projects can still be fetched, prepared,
+# and at least compiled in GitHub Actions on a macOS runner.
+#
+# Important design choice:
+# - This is primarily a "build confidence" workflow, not a guaranteed
+#   end-to-end inference workflow.
+# - Many local-LLM Apple projects depend on model downloads, runtime
+#   permissions, simulator/device behavior, signing, or networked model
+#   backends, which can make true inference tests flaky in CI.
+# - Because of that, the workflow focuses on:
+#     1. cloning each example
+#     2. restoring caches where useful
+#     3. installing any required generation tooling
+#     4. building or testing what is practical in CI
+#
+# The matrix currently covers:
+# - MLX Swift Examples
+# - AnyLanguageModel
+# - BisonAI iOS
+# - llama.cpp SwiftUI example
+
+on:
+  # Allow manual runs from the GitHub Actions tab.
+  workflow_dispatch:
+
+  # Automatically run when this workflow file itself changes on pushes.
+  push:
+    paths:
+      - ".github/workflows/llm-xcode-examples-ci.yml"
+
+  # Also validate changes to this workflow in pull requests.
+  pull_request:
+    paths:
+      - ".github/workflows/llm-xcode-examples-ci.yml"
+
+# Prevent duplicate runs for the same ref/workflow combination.
+# If a newer run starts for the same branch/PR, older in-progress runs
+# are cancelled to save macOS runner time.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-test:
+    # The matrix entry name becomes the visible job title in Actions UI.
+    name: ${{ matrix.example.name }}
+
+    # Use a modern macOS runner suitable for recent Xcode versions.
+    runs-on: macos-15
+
+    # macOS runners are expensive and these projects can take time to
+    # resolve dependencies or build Apple frameworks, so allow a full hour.
+    timeout-minutes: 60
+
+    strategy:
+      # Do not stop the entire matrix if one example fails.
+      # This is useful because one upstream project may break while others
+      # still build successfully, and we want visibility into each result.
+      fail-fast: false
+
+      # Keep parallelism modest to reduce resource pressure and limit
+      # simultaneous heavy Xcode/SwiftPM workloads on hosted runners.
+      max-parallel: 2
+
+      matrix:
+        example:
+          - name: MLX Swift Examples
+            repo: https://github.com/ml-explore/mlx-swift-examples.git
+            ref: main
+            kind: mlx-swift-examples
+
+          - name: AnyLanguageModel
+            repo: https://github.com/huggingface/AnyLanguageModel.git
+            ref: main
+            kind: any-language-model
+
+          - name: BisonAI iOS
+            repo: https://github.com/bisonbet/BisonAI-iOS.git
+            ref: main
+            kind: bisonai-ios
+
+          - name: llama.cpp SwiftUI example
+            repo: https://github.com/ggml-org/llama.cpp.git
+            ref: master
+            kind: llama-swiftui
+
+    env:
+      # Pin the Xcode path explicitly so the workflow remains stable even if
+      # multiple Xcode versions are installed on the runner image.
+      #
+      # If GitHub updates the runner image and removes/renames this Xcode
+      # bundle, update this path accordingly.
+      DEVELOPER_DIR: /Applications/Xcode_16.3.app/Contents/Developer
+
+      # Make command output less buffered so logs stream more clearly during
+      # long builds and are easier to inspect when failures occur.
+      NSUnbufferedIO: YES
+
+    steps:
+      - name: Checkout workflow repo
+        uses: actions/checkout@v4
+
+      - name: Show Xcode and Swift toolchain details
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          echo "Developer directory:"
+          xcode-select -p
+
+          echo
+          echo "Xcode version:"
+          xcodebuild -version
+
+          echo
+          echo "Swift version:"
+          swift --version
+
+          echo
+          echo "Available simulator runtimes (best effort):"
+          xcrun simctl list runtimes || true
+
+          echo
+          echo "Available simulator devices (best effort):"
+          xcrun simctl list devices || true
+
+      - name: Clone target example repository
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          echo "Cloning repository:"
+          echo "  repo = ${{ matrix.example.repo }}"
+          echo "  ref  = ${{ matrix.example.ref }}"
+          echo "  kind = ${{ matrix.example.kind }}"
+
+          git clone \
+            --depth 1 \
+            --branch "${{ matrix.example.ref }}" \
+            "${{ matrix.example.repo }}" \
+            target
+
+          echo
+          echo "Top-level contents of cloned repository:"
+          ls -la target
+
+      - name: Restore SwiftPM and DerivedData caches
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.swiftpm
+            ~/Library/Caches/org.swift.swiftpm
+            ~/Library/Developer/Xcode/DerivedData
+          key: ${{ runner.os }}-xcode-16_3-${{ matrix.example.kind }}-${{ hashFiles('target/Package.resolved', 'target/**/Package.resolved', 'target/project.yml') }}
+          restore-keys: |
+            ${{ runner.os }}-xcode-16_3-${{ matrix.example.kind }}-
+            ${{ runner.os }}-xcode-16_3-
+
+      - name: Install or prepare extra tools when needed
+        working-directory: target
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          case "${{ matrix.example.kind }}" in
+            bisonai-ios)
+              echo "This project uses XcodeGen, so install it via Homebrew."
+              brew install xcodegen
+              xcodegen version
+              ;;
+
+            *)
+              echo "No additional preparation tools required for this target."
+              ;;
+          esac
+
+      - name: Resolve, generate, build, and test the selected example
+        working-directory: target
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          echo "Selected target kind: ${{ matrix.example.kind }}"
+
+          case "${{ matrix.example.kind }}" in
+
+            mlx-swift-examples)
+              echo "Building MLX Swift example scheme: LLMBasic"
+              xcodebuild \
+                -project mlx-swift-examples.xcodeproj \
+                -scheme LLMBasic \
+                -destination 'platform=macOS' \
+                -derivedDataPath DerivedData \
+                CODE_SIGNING_ALLOWED=NO \
+                build
+
+              echo
+              echo "Building MLX Swift example scheme: LLMEval"
+              xcodebuild \
+                -project mlx-swift-examples.xcodeproj \
+                -scheme LLMEval \
+                -destination 'platform=macOS' \
+                -derivedDataPath DerivedData \
+                CODE_SIGNING_ALLOWED=NO \
+                build
+              ;;
+
+            any-language-model)
+              echo "Resolving Swift package dependencies"
+              swift package resolve
+
+              echo
+              echo "Running package tests with default configuration"
+              swift test
+
+              echo
+              echo "Building AnyLanguageModel with CoreML trait enabled"
+              swift build --traits CoreML
+
+              echo
+              echo "Building AnyLanguageModel with Llama trait enabled"
+              swift build --traits Llama
+
+              echo
+              echo "Building AnyLanguageModel with MLX trait enabled"
+              swift build --traits MLX
+              ;;
+
+            bisonai-ios)
+              echo "Generating Xcode project from project.yml via XcodeGen"
+              xcodegen generate
+
+              echo
+              echo "Building BisonAI for iOS Simulator"
+              xcodebuild \
+                -project BisonAI.xcodeproj \
+                -scheme BisonAI \
+                -destination 'platform=iOS Simulator,name=iPhone 16' \
+                -derivedDataPath DerivedData \
+                CODE_SIGNING_ALLOWED=NO \
+                build
+
+              echo
+              echo "Running BisonAI tests on iOS Simulator"
+              xcodebuild \
+                -project BisonAI.xcodeproj \
+                -scheme BisonAI \
+                -destination 'platform=iOS Simulator,name=iPhone 16' \
+                -derivedDataPath DerivedData \
+                CODE_SIGNING_ALLOWED=NO \
+                test
+              ;;
+
+            llama-swiftui)
+              echo "Building llama.cpp Apple XCFramework dependencies"
+              ./build-xcframework.sh
+
+              echo
+              echo "Building SwiftUI sample app for iOS Simulator"
+              xcodebuild \
+                -project examples/llama.swiftui/llama.swiftui.xcodeproj \
+                -scheme llama.swiftui \
+                -destination 'platform=iOS Simulator,name=iPhone 16' \
+                -derivedDataPath DerivedData \
+                CODE_SIGNING_ALLOWED=NO \
+                build
+              ;;
+
+            *)
+              echo "Unknown matrix.example.kind=${{ matrix.example.kind }}" >&2
+              exit 1
+              ;;
+          esac
+
+      - name: Upload diagnostic build logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.example.kind }}-derived-data
+          path: |
+            target/DerivedData/Logs
+            target/build-apple
+          if-no-files-found: ignore
