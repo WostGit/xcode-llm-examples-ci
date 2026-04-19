@@ -1,286 +1,534 @@
-name: xcode-llm-examples-ci
-
-# This workflow is intended to verify that a collection of current
-# Xcode-oriented LLM example projects can still be fetched, prepared,
-# and at least compiled in GitHub Actions on a macOS runner.
-#
-# Important design choice:
-# - This is primarily a "build confidence" workflow, not a guaranteed
-#   end-to-end inference workflow.
-# - Many local-LLM Apple projects depend on model downloads, runtime
-#   permissions, simulator/device behavior, signing, or networked model
-#   backends, which can make true inference tests flaky in CI.
-# - Because of that, the workflow focuses on:
-#     1. cloning each example
-#     2. restoring caches where useful
-#     3. installing any required generation tooling
-#     4. building or testing what is practical in CI
-#
-# The matrix currently covers:
-# - MLX Swift Examples
-# - AnyLanguageModel
-# - BisonAI iOS
-# - llama.cpp SwiftUI example
+name: Exhaustive Xcode Debug Suite
 
 on:
-  # Allow manual runs from the GitHub Actions tab.
+  push:
+  pull_request:
   workflow_dispatch:
 
-  # Automatically run when this workflow file itself changes on pushes.
-  push:
-    paths:
-      - ".github/workflows/llm-xcode-examples-ci.yml"
-
-  # Also validate changes to this workflow in pull requests.
-  pull_request:
-    paths:
-      - ".github/workflows/llm-xcode-examples-ci.yml"
-
-# Prevent duplicate runs for the same ref/workflow combination.
-# If a newer run starts for the same branch/PR, older in-progress runs
-# are cancelled to save macOS runner time.
-concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
-
 jobs:
-  build-and-test:
-    # The matrix entry name becomes the visible job title in Actions UI.
-    name: ${{ matrix.example.name }}
-
-    # Use a modern macOS runner suitable for recent Xcode versions.
+  exhaustive-debug:
     runs-on: macos-15
-
-    # macOS runners are expensive and these projects can take time to
-    # resolve dependencies or build Apple frameworks, so allow a full hour.
-    timeout-minutes: 60
-
-    strategy:
-      # Do not stop the entire matrix if one example fails.
-      # This is useful because one upstream project may break while others
-      # still build successfully, and we want visibility into each result.
-      fail-fast: false
-
-      # Keep parallelism modest to reduce resource pressure and limit
-      # simultaneous heavy Xcode/SwiftPM workloads on hosted runners.
-      max-parallel: 2
-
-      matrix:
-        example:
-          - name: MLX Swift Examples
-            repo: https://github.com/ml-explore/mlx-swift-examples.git
-            ref: main
-            kind: mlx-swift-examples
-
-          - name: AnyLanguageModel
-            repo: https://github.com/huggingface/AnyLanguageModel.git
-            ref: main
-            kind: any-language-model
-
-          - name: BisonAI iOS
-            repo: https://github.com/bisonbet/BisonAI-iOS.git
-            ref: main
-            kind: bisonai-ios
-
-          - name: llama.cpp SwiftUI example
-            repo: https://github.com/ggml-org/llama.cpp.git
-            ref: master
-            kind: llama-swiftui
-
-    env:
-      # Pin the Xcode path explicitly so the workflow remains stable even if
-      # multiple Xcode versions are installed on the runner image.
-      #
-      # If GitHub updates the runner image and removes/renames this Xcode
-      # bundle, update this path accordingly.
-      DEVELOPER_DIR: /Applications/Xcode_16.3.app/Contents/Developer
-
-      # Make command output less buffered so logs stream more clearly during
-      # long builds and are easier to inspect when failures occur.
-      NSUnbufferedIO: YES
+    timeout-minutes: 120
 
     steps:
-      - name: Checkout workflow repo
+      - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Show Xcode and Swift toolchain details
+      - name: Environment snapshot
         shell: bash
         run: |
-          set -euxo pipefail
+          set +e
+          mkdir -p ci_results/logs ci_results/meta
+          {
+            echo "## Environment"
+            echo
+            echo '```'
+            echo "DATE: $(date)"
+            echo "PWD: $(pwd)"
+            echo "RUNNER_OS: $RUNNER_OS"
+            echo "RUNNER_ARCH: $RUNNER_ARCH"
+            echo "GITHUB_REPOSITORY: $GITHUB_REPOSITORY"
+            echo "GITHUB_REF: $GITHUB_REF"
+            echo
+            xcodebuild -version || true
+            echo
+            swift --version || true
+            echo
+            xcode-select -p || true
+            echo
+            xcodebuild -showsdks || true
+            echo
+            xcrun simctl list runtimes || true
+            echo
+            xcrun simctl list devices available || true
+            echo '```'
+          } | tee ci_results/meta/environment.md
 
-          echo "Developer directory:"
-          xcode-select -p
+          cat ci_results/meta/environment.md >> "$GITHUB_STEP_SUMMARY"
 
-          echo
-          echo "Xcode version:"
-          xcodebuild -version
-
-          echo
-          echo "Swift version:"
-          swift --version
-
-          echo
-          echo "Available simulator runtimes (best effort):"
-          xcrun simctl list runtimes || true
-
-          echo
-          echo "Available simulator devices (best effort):"
-          xcrun simctl list devices || true
-
-      - name: Clone target example repository
+      - name: Run exhaustive suite
         shell: bash
         run: |
-          set -euxo pipefail
+          set +e
 
-          echo "Cloning repository:"
-          echo "  repo = ${{ matrix.example.repo }}"
-          echo "  ref  = ${{ matrix.example.ref }}"
-          echo "  kind = ${{ matrix.example.kind }}"
+          python3 - <<'PY'
+          import json
+          import os
+          import re
+          import shlex
+          import subprocess
+          import sys
+          import time
+          from pathlib import Path
 
-          git clone \
-            --depth 1 \
-            --branch "${{ matrix.example.ref }}" \
-            "${{ matrix.example.repo }}" \
-            target
+          ROOT = Path(".").resolve()
+          OUT = ROOT / "ci_results"
+          LOGS = OUT / "logs"
+          META = OUT / "meta"
+          LOGS.mkdir(parents=True, exist_ok=True)
+          META.mkdir(parents=True, exist_ok=True)
 
-          echo
-          echo "Top-level contents of cloned repository:"
-          ls -la target
+          SUMMARY_JSON = OUT / "summary.json"
+          SUMMARY_MD = OUT / "summary.md"
 
-      - name: Restore SwiftPM and DerivedData caches
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.swiftpm
-            ~/Library/Caches/org.swift.swiftpm
-            ~/Library/Developer/Xcode/DerivedData
-          key: ${{ runner.os }}-xcode-16_3-${{ matrix.example.kind }}-${{ hashFiles('target/Package.resolved', 'target/**/Package.resolved', 'target/project.yml') }}
-          restore-keys: |
-            ${{ runner.os }}-xcode-16_3-${{ matrix.example.kind }}-
-            ${{ runner.os }}-xcode-16_3-
+          STEP_SUMMARY = os.environ.get("GITHUB_STEP_SUMMARY")
 
-      - name: Install or prepare extra tools when needed
-        working-directory: target
-        shell: bash
-        run: |
-          set -euxo pipefail
+          TEST_ACTIONS = ["build", "test"]
 
-          case "${{ matrix.example.kind }}" in
-            bisonai-ios)
-              echo "This project uses XcodeGen, so install it via Homebrew."
-              brew install xcodegen
-              xcodegen version
-              ;;
+          FALLBACK_DESTINATIONS = [
+              "platform=macOS,arch=arm64",
+              "platform=macOS,arch=x86_64",
+              "platform=macOS",
+              "generic/platform=macOS",
+              "platform=iOS Simulator,OS=latest,name=iPhone 16",
+              "platform=iOS Simulator,OS=latest,name=iPhone 15",
+              "platform=iOS Simulator,OS=latest,name=iPhone 14",
+              "platform=iOS Simulator,name=iPhone 16",
+              "platform=iOS Simulator,name=iPhone 15",
+              "platform=iOS Simulator,name=iPhone 14",
+              "generic/platform=iOS Simulator",
+              "generic/platform=iOS",
+          ]
 
-            *)
-              echo "No additional preparation tools required for this target."
-              ;;
-          esac
+          def run(cmd, cwd=None, timeout=None):
+              started = time.time()
+              try:
+                  proc = subprocess.run(
+                      cmd,
+                      cwd=cwd,
+                      stdout=subprocess.PIPE,
+                      stderr=subprocess.STDOUT,
+                      text=True,
+                      timeout=timeout,
+                  )
+                  return {
+                      "ok": proc.returncode == 0,
+                      "returncode": proc.returncode,
+                      "output": proc.stdout,
+                      "seconds": round(time.time() - started, 2),
+                      "exception": None,
+                  }
+              except Exception as e:
+                  return {
+                      "ok": False,
+                      "returncode": -1,
+                      "output": "",
+                      "seconds": round(time.time() - started, 2),
+                      "exception": repr(e),
+                  }
 
-      - name: Resolve, generate, build, and test the selected example
-        working-directory: target
-        shell: bash
-        run: |
-          set -euxo pipefail
+          def write_text(path, text):
+              path.parent.mkdir(parents=True, exist_ok=True)
+              path.write_text(text, encoding="utf-8")
 
-          echo "Selected target kind: ${{ matrix.example.kind }}"
+          def append_text(path, text):
+              path.parent.mkdir(parents=True, exist_ok=True)
+              with path.open("a", encoding="utf-8") as f:
+                  f.write(text)
 
-          case "${{ matrix.example.kind }}" in
+          def sanitize(name):
+              return re.sub(r"[^A-Za-z0-9._-]+", "_", name)
 
-            mlx-swift-examples)
-              echo "Building MLX Swift example scheme: LLMBasic"
-              xcodebuild \
-                -project mlx-swift-examples.xcodeproj \
-                -scheme LLMBasic \
-                -destination 'platform=macOS' \
-                -derivedDataPath DerivedData \
-                CODE_SIGNING_ALLOWED=NO \
-                build
+          def extract_key_lines(text, limit=25):
+              patterns = [
+                  r"error: .*",
+                  r"fatal error: .*",
+                  r"\*\* BUILD FAILED \*\*",
+                  r"Testing failed:.*",
+                  r"Unable to find a destination matching.*",
+                  r"Ineligible destinations.*",
+                  r"no such module .*",
+                  r"ComputeTargetDependencyGraph",
+                  r"Package resolution failed.*",
+                  r"Process completed with exit code \d+",
+              ]
+              hits = []
+              for line in text.splitlines():
+                  s = line.strip()
+                  for p in patterns:
+                      if re.search(p, s, flags=re.IGNORECASE):
+                          hits.append(s)
+                          break
+              dedup = []
+              seen = set()
+              for h in hits:
+                  if h not in seen:
+                      seen.add(h)
+                      dedup.append(h)
+              return dedup[:limit]
 
-              echo
-              echo "Building MLX Swift example scheme: LLMEval"
-              xcodebuild \
-                -project mlx-swift-examples.xcodeproj \
-                -scheme LLMEval \
-                -destination 'platform=macOS' \
-                -derivedDataPath DerivedData \
-                CODE_SIGNING_ALLOWED=NO \
-                build
-              ;;
+          def find_projects():
+              projects = []
+              for p in ROOT.rglob("*.xcodeproj"):
+                  if ".build/" in str(p) or "SourcePackages/" in str(p):
+                      continue
+                  projects.append(p)
+              return sorted(set(projects))
 
-            any-language-model)
-              echo "Resolving Swift package dependencies"
-              swift package resolve
+          def parse_schemes(project):
+              res = run(["xcodebuild", "-list", "-project", str(project)], timeout=300)
+              text = (res["output"] or "") + ("\n" + (res["exception"] or "") if res["exception"] else "")
+              lines = text.splitlines()
+              schemes = []
+              in_schemes = False
+              for line in lines:
+                  if line.strip() == "Schemes:":
+                      in_schemes = True
+                      continue
+                  if in_schemes:
+                      if not line.strip():
+                          if schemes:
+                              break
+                          continue
+                      if line.startswith("        ") or line.startswith("    ") or line.startswith("\t"):
+                          schemes.append(line.strip())
+                      elif schemes:
+                          break
+              return schemes, text, res["ok"]
 
-              echo
-              echo "Running package tests with default configuration"
-              swift test
+          def parse_destinations(output):
+              dests = []
+              for line in output.splitlines():
+                  s = line.strip()
+                  if s.startswith("{") and s.endswith("}"):
+                      dests.append(s)
+              return dests
 
-              echo
-              echo "Building AnyLanguageModel with CoreML trait enabled"
-              swift build --traits CoreML
+          def classify_scheme(scheme):
+              s = scheme.lower()
+              wants_test = any(k in s for k in ["test", "tests", "uitest", "uitests"])
+              likely_ios = any(k in s for k in ["ios", "iphone", "ipad"])
+              likely_macos = any(k in s for k in ["mac", "osx"])
+              return {
+                  "wants_test": wants_test,
+                  "likely_ios": likely_ios,
+                  "likely_macos": likely_macos,
+              }
 
-              echo
-              echo "Building AnyLanguageModel with Llama trait enabled"
-              swift build --traits Llama
+          def prioritized_destinations(scheme):
+              info = classify_scheme(scheme)
+              dests = FALLBACK_DESTINATIONS[:]
+              if info["likely_ios"]:
+                  preferred = [
+                      "platform=iOS Simulator,OS=latest,name=iPhone 16",
+                      "platform=iOS Simulator,OS=latest,name=iPhone 15",
+                      "platform=iOS Simulator,OS=latest,name=iPhone 14",
+                      "platform=iOS Simulator,name=iPhone 16",
+                      "platform=iOS Simulator,name=iPhone 15",
+                      "platform=iOS Simulator,name=iPhone 14",
+                      "generic/platform=iOS Simulator",
+                      "generic/platform=iOS",
+                      "platform=macOS,arch=arm64",
+                      "platform=macOS",
+                  ]
+                  return preferred
+              if info["likely_macos"]:
+                  preferred = [
+                      "platform=macOS,arch=arm64",
+                      "platform=macOS,arch=x86_64",
+                      "platform=macOS",
+                      "generic/platform=macOS",
+                      "platform=iOS Simulator,OS=latest,name=iPhone 16",
+                      "generic/platform=iOS Simulator",
+                  ]
+                  return preferred
+              return dests
 
-              echo
-              echo "Building AnyLanguageModel with MLX trait enabled"
-              swift build --traits MLX
-              ;;
+          def choose_actions(scheme):
+              info = classify_scheme(scheme)
+              if info["wants_test"]:
+                  return ["build", "test"]
+              return ["build", "test"]
 
-            bisonai-ios)
-              echo "Generating Xcode project from project.yml via XcodeGen"
-              xcodegen generate
+          def format_command(cmd):
+              return " ".join(shlex.quote(c) for c in cmd)
 
-              echo
-              echo "Building BisonAI for iOS Simulator"
-              xcodebuild \
-                -project BisonAI.xcodeproj \
-                -scheme BisonAI \
-                -destination 'platform=iOS Simulator,name=iPhone 16' \
-                -derivedDataPath DerivedData \
-                CODE_SIGNING_ALLOWED=NO \
-                build
+          def write_summary(results, projects_meta):
+              total_cases = len(results)
+              passed_cases = sum(1 for r in results if r["final_status"] == "passed")
+              failed_cases = total_cases - passed_cases
 
-              echo
-              echo "Running BisonAI tests on iOS Simulator"
-              xcodebuild \
-                -project BisonAI.xcodeproj \
-                -scheme BisonAI \
-                -destination 'platform=iOS Simulator,name=iPhone 16' \
-                -derivedDataPath DerivedData \
-                CODE_SIGNING_ALLOWED=NO \
-                test
-              ;;
+              lines = []
+              lines.append("# Exhaustive Xcode Debug Summary")
+              lines.append("")
+              lines.append(f"- Projects discovered: **{len(projects_meta)}**")
+              lines.append(f"- Cases run: **{total_cases}**")
+              lines.append(f"- Passed: **{passed_cases}**")
+              lines.append(f"- Failed: **{failed_cases}**")
+              lines.append("")
+              lines.append("## Cases")
+              lines.append("")
+              lines.append("| Case | Final status | Action | Winning destination | Duration (s) | Top issue |")
+              lines.append("|---|---|---|---|---:|---|")
 
-            llama-swiftui)
-              echo "Building llama.cpp Apple XCFramework dependencies"
-              ./build-xcframework.sh
+              for r in results:
+                  top_issue = ""
+                  if r["final_key_lines"]:
+                      top_issue = r["final_key_lines"][0].replace("|", "\\|")
+                  lines.append(
+                      f"| {r['case_name']} | {r['final_status']} | {r['final_action']} | "
+                      f"{(r['winning_destination'] or '').replace('|','/')} | {r['total_seconds']:.2f} | {top_issue} |"
+                  )
 
-              echo
-              echo "Building SwiftUI sample app for iOS Simulator"
-              xcodebuild \
-                -project examples/llama.swiftui/llama.swiftui.xcodeproj \
-                -scheme llama.swiftui \
-                -destination 'platform=iOS Simulator,name=iPhone 16' \
-                -derivedDataPath DerivedData \
-                CODE_SIGNING_ALLOWED=NO \
-                build
-              ;;
+              lines.append("")
+              lines.append("## Detailed results")
+              lines.append("")
 
-            *)
-              echo "Unknown matrix.example.kind=${{ matrix.example.kind }}" >&2
-              exit 1
-              ;;
-          esac
+              for r in results:
+                  lines.append(f"### {r['case_name']}")
+                  lines.append("")
+                  lines.append(f"- Project: `{r['project']}`")
+                  lines.append(f"- Scheme: `{r['scheme']}`")
+                  lines.append(f"- Final status: **{r['final_status']}**")
+                  lines.append(f"- Action: `{r['final_action']}`")
+                  lines.append(f"- Winning destination: `{r['winning_destination']}`")
+                  lines.append(f"- Duration: `{r['total_seconds']:.2f}s`")
+                  lines.append(f"- Log file: `{r['main_log']}`")
+                  lines.append("")
+                  lines.append("Top extracted lines:")
+                  if r["final_key_lines"]:
+                      for item in r["final_key_lines"][:10]:
+                          lines.append(f"- {item}")
+                  else:
+                      lines.append("- None")
+                  lines.append("")
+                  lines.append("Attempts:")
+                  for a in r["attempts"]:
+                      lines.append(
+                          f"- `{a['phase']}` / `{a['action']}` / `{a['destination']}` -> "
+                          f"`{a['status']}` in `{a['seconds']:.2f}s`"
+                      )
+                  lines.append("")
 
-      - name: Upload diagnostic build logs on failure
-        if: failure()
+              md = "\n".join(lines) + "\n"
+              write_text(SUMMARY_MD, md)
+              if STEP_SUMMARY:
+                  append_text(Path(STEP_SUMMARY), md)
+
+          projects = find_projects()
+          projects_meta = []
+          results = []
+
+          if not projects:
+              msg = "No .xcodeproj files found."
+              write_text(OUT / "summary.md", msg + "\n")
+              if STEP_SUMMARY:
+                  append_text(Path(STEP_SUMMARY), "# Exhaustive Xcode Debug Summary\n\n- No `.xcodeproj` files found.\n")
+              print(msg)
+              sys.exit(1)
+
+          for project in projects:
+              project_name = project.name
+              proj_slug = sanitize(project_name)
+              proj_dir = LOGS / proj_slug
+              proj_dir.mkdir(parents=True, exist_ok=True)
+
+              list_res = run(["xcodebuild", "-list", "-project", str(project)], timeout=300)
+              write_text(proj_dir / "00_list.log", list_res["output"] + (("\nEXCEPTION:\n" + list_res["exception"]) if list_res["exception"] else ""))
+
+              schemes, parsed_text, list_ok = parse_schemes(project)
+              if not schemes:
+                  projects_meta.append({
+                      "project": str(project),
+                      "schemes": [],
+                      "list_ok": list_ok,
+                  })
+                  continue
+
+              projects_meta.append({
+                  "project": str(project),
+                  "schemes": schemes,
+                  "list_ok": list_ok,
+              })
+
+              for scheme in schemes:
+                  case_name = f"{project.stem}::{scheme}"
+                  case_slug = sanitize(case_name)
+                  case_dir = proj_dir / case_slug
+                  case_dir.mkdir(parents=True, exist_ok=True)
+
+                  attempts = []
+                  case_started = time.time()
+
+                  # Phase 1: showdestinations
+                  show_cmd = ["xcodebuild", "-project", str(project), "-scheme", scheme, "-showdestinations"]
+                  show_res = run(show_cmd, timeout=300)
+                  show_log = case_dir / "01_showdestinations.log"
+                  write_text(show_log, show_res["output"] + (("\nEXCEPTION:\n" + show_res["exception"]) if show_res["exception"] else ""))
+                  show_dests = parse_destinations(show_res["output"])
+
+                  attempts.append({
+                      "phase": "showdestinations",
+                      "action": "showdestinations",
+                      "destination": "",
+                      "status": "passed" if show_res["ok"] else "failed",
+                      "seconds": show_res["seconds"],
+                      "returncode": show_res["returncode"],
+                      "log": str(show_log),
+                      "key_lines": extract_key_lines(show_res["output"]),
+                      "command": format_command(show_cmd),
+                  })
+
+                  # Phase 2: resolve packages (with retry)
+                  resolve_ok = False
+                  resolve_best_lines = []
+                  for idx in range(1, 3):
+                      resolve_cmd = ["xcodebuild", "-resolvePackageDependencies", "-project", str(project), "-scheme", scheme]
+                      resolve_res = run(resolve_cmd, timeout=1200)
+                      resolve_log = case_dir / f"02_resolve_packages_try{idx}.log"
+                      write_text(resolve_log, resolve_res["output"] + (("\nEXCEPTION:\n" + resolve_res["exception"]) if resolve_res["exception"] else ""))
+                      key_lines = extract_key_lines(resolve_res["output"])
+                      attempts.append({
+                          "phase": "resolvePackageDependencies",
+                          "action": "resolve",
+                          "destination": "",
+                          "status": "passed" if resolve_res["ok"] else "failed",
+                          "seconds": resolve_res["seconds"],
+                          "returncode": resolve_res["returncode"],
+                          "log": str(resolve_log),
+                          "key_lines": key_lines,
+                          "command": format_command(resolve_cmd),
+                      })
+                      resolve_best_lines = key_lines or resolve_best_lines
+                      if resolve_res["ok"]:
+                          resolve_ok = True
+                          break
+
+                  # Phase 3/4: build and test with fallback destinations
+                  wanted_actions = choose_actions(scheme)
+                  winning_destination = None
+                  final_status = "failed"
+                  final_action = None
+                  final_key_lines = []
+                  main_log = None
+
+                  for action in wanted_actions:
+                      action_passed = False
+                      for dest in prioritized_destinations(scheme):
+                          # retry each destination once if it fails
+                          for idx in range(1, 3):
+                              log_name = f"03_{action}_{sanitize(dest)}_try{idx}.log"
+                              log_path = case_dir / log_name
+                              cmd = [
+                                  "xcodebuild",
+                                  "-project", str(project),
+                                  "-scheme", scheme,
+                                  "-destination", dest,
+                                  "clean",
+                                  action,
+                              ]
+                              res = run(cmd, timeout=3600)
+                              full_output = res["output"] + (("\nEXCEPTION:\n" + res["exception"]) if res["exception"] else "")
+                              write_text(log_path, full_output)
+                              key_lines = extract_key_lines(full_output)
+
+                              status = "passed" if res["ok"] else "failed"
+                              attempts.append({
+                                  "phase": action,
+                                  "action": action,
+                                  "destination": dest,
+                                  "status": status,
+                                  "seconds": res["seconds"],
+                                  "returncode": res["returncode"],
+                                  "log": str(log_path),
+                                  "key_lines": key_lines,
+                                  "command": format_command(cmd),
+                              })
+
+                              if res["ok"]:
+                                  action_passed = True
+                                  winning_destination = dest
+                                  final_status = "passed"
+                                  final_action = action
+                                  final_key_lines = key_lines
+                                  main_log = str(log_path)
+                                  break
+
+                              if not final_key_lines and key_lines:
+                                  final_key_lines = key_lines
+                                  main_log = str(log_path)
+
+                              # If destination clearly invalid, move on to next destination quickly after first try
+                              invalid_dest = any(
+                                  "Unable to find a destination matching" in k or "Ineligible destinations" in k
+                                  for k in key_lines
+                              )
+                              if invalid_dest:
+                                  break
+
+                          if action_passed:
+                              break
+
+                      if action_passed:
+                          # If build passes, still try test; if test fails, preserve test as final action/status
+                          if action == "build":
+                              continue
+                          break
+                      else:
+                          final_status = "failed"
+                          final_action = action
+
+                          # If build itself fails, skip test only if no destination worked for build at all.
+                          if action == "build":
+                              break
+
+                  if not final_key_lines:
+                      final_key_lines = resolve_best_lines
+
+                  result = {
+                      "case_name": case_name,
+                      "project": str(project),
+                      "scheme": scheme,
+                      "attempts": attempts,
+                      "winning_destination": winning_destination,
+                      "final_status": final_status,
+                      "final_action": final_action or "build",
+                      "final_key_lines": final_key_lines,
+                      "main_log": main_log or "",
+                      "total_seconds": round(time.time() - case_started, 2),
+                  }
+                  results.append(result)
+
+          payload = {
+              "projects": projects_meta,
+              "results": results,
+          }
+          write_text(SUMMARY_JSON, json.dumps(payload, indent=2))
+          write_summary(results, projects_meta)
+
+          print("\n=== FINAL AGGREGATED SUMMARY ===\n")
+          passed = 0
+          failed = 0
+          for r in results:
+              if r["final_status"] == "passed":
+                  passed += 1
+                  icon = "PASS"
+              else:
+                  failed += 1
+                  icon = "FAIL"
+              print(f"[{icon}] {r['case_name']}")
+              print(f"  action     : {r['final_action']}")
+              print(f"  destination: {r['winning_destination']}")
+              print(f"  duration   : {r['total_seconds']:.2f}s")
+              print(f"  main log   : {r['main_log']}")
+              if r["final_key_lines"]:
+                  print("  highlights :")
+                  for line in r["final_key_lines"][:8]:
+                      print(f"    - {line}")
+              print()
+
+          print("=== TOTALS ===")
+          print(f"passed: {passed}")
+          print(f"failed: {failed}")
+          print(f"total : {len(results)}")
+
+          sys.exit(1 if failed > 0 else 0)
+          PY
+
+      - name: Upload exhaustive logs and summaries
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.example.kind }}-derived-data
-          path: |
-            target/DerivedData/Logs
-            target/build-apple
-          if-no-files-found: ignore
+          name: exhaustive-xcode-debug-results
+          path: ci_results
+          retention-days: 14
