@@ -1,501 +1,376 @@
-name: Exhaustive Xcode Debug Suite (Project + SwiftPM Aware)
+name: Progressive Xcode LLM Test Suite
 
 on:
-  push:
-  pull_request:
   workflow_dispatch:
+  push:
+    paths:
+      - ".github/workflows/progressive-xcode-llm-suite.yml"
+  pull_request:
+    paths:
+      - ".github/workflows/progressive-xcode-llm-suite.yml"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
-  exhaustive-debug:
+  progressive-suite:
     runs-on: macos-15
-    timeout-minutes: 180
+    timeout-minutes: 120
+
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_16.3.app/Contents/Developer
+      NSUnbufferedIO: YES
 
     steps:
-      - name: Checkout
+      - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Pin Xcode 16.4
+      - name: Show toolchain info
         shell: bash
         run: |
-          set +e
-          sudo xcode-select -s /Applications/Xcode_16.4.app/Contents/Developer
+          set -euxo pipefail
           xcode-select -p
           xcodebuild -version
           swift --version
+          xcrun simctl list runtimes || true
+          xcrun simctl list devices || true
 
-      - name: Capture environment
+      - name: Restore cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.swiftpm
+            ~/Library/Caches/org.swift.swiftpm
+            ~/Library/Developer/Xcode/DerivedData
+          key: ${{ runner.os }}-progressive-xcode-16_3-${{ hashFiles('**/Package.resolved', '**/project.yml') }}
+          restore-keys: |
+            ${{ runner.os }}-progressive-xcode-16_3-
+
+      - name: Create workspace folders
         shell: bash
         run: |
-          set +e
-          mkdir -p ci_results/meta ci_results/logs
-          {
-            echo "# Environment Snapshot"
-            echo
-            echo '```'
-            echo "DATE: $(date)"
-            echo "PWD: $(pwd)"
-            echo "RUNNER_OS: $RUNNER_OS"
-            echo "RUNNER_ARCH: $RUNNER_ARCH"
-            echo "GITHUB_REPOSITORY: $GITHUB_REPOSITORY"
-            echo "GITHUB_REF: $GITHUB_REF"
-            echo
-            xcodebuild -version || true
-            echo
-            swift --version || true
-            echo
-            xcode-select -p || true
-            echo
-            echo "== SDKs =="
-            xcodebuild -showsdks || true
-            echo
-            echo "== Runtimes =="
-            xcrun simctl list runtimes || true
-            echo
-            echo "== Available Devices =="
-            xcrun simctl list devices available || true
-            echo
-            echo "== Repository Files =="
-            find . -maxdepth 3 \( -name "*.xcodeproj" -o -name "Package.swift" -o -name "*.xcworkspace" \) | sort || true
-            echo '```'
-          } | tee ci_results/meta/environment.md
-          cat ci_results/meta/environment.md >> "$GITHUB_STEP_SUMMARY"
+          set -euxo pipefail
+          mkdir -p ci/repos ci/results/logs ci/results/artifacts
 
-      - name: Run exhaustive suite
+      - name: Clone target repositories
         shell: bash
         run: |
-          set +e
-          python3 - <<'PY'
+          set -euxo pipefail
+
+          clone_repo () {
+            local url="$1"
+            local ref="$2"
+            local dir="$3"
+            git clone --depth 1 --branch "$ref" "$url" "ci/repos/$dir"
+          }
+
+          clone_repo https://github.com/huggingface/AnyLanguageModel.git main AnyLanguageModel
+          clone_repo https://github.com/ml-explore/mlx-swift-examples.git main mlx-swift-examples
+          clone_repo https://github.com/bisonbet/BisonAI-iOS.git main BisonAI-iOS
+          clone_repo https://github.com/ggml-org/llama.cpp.git master llama.cpp
+
+      - name: Install optional generators
+        shell: bash
+        run: |
+          set -euxo pipefail
+          if [ -f "ci/repos/BisonAI-iOS/project.yml" ]; then
+            brew install xcodegen
+            xcodegen version
+          fi
+
+      - name: Discover targets and write manifest
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python3 <<'PY'
           import json
           import os
-          import re
-          import shlex
           import subprocess
-          import sys
+          from pathlib import Path
+
+          root = Path("ci/repos")
+          manifest = []
+
+          def sh(cmd, cwd=None):
+              p = subprocess.run(cmd, cwd=cwd, text=True, capture_output=True)
+              return p.returncode, p.stdout, p.stderr
+
+          def add_target(item):
+              manifest.append(item)
+
+          for repo in sorted(root.iterdir()):
+              if not repo.is_dir():
+                  continue
+
+              pkg = repo / "Package.swift"
+              projs = list(repo.rglob("*.xcodeproj"))
+              workspaces = list(repo.rglob("*.xcworkspace"))
+              has_project_yml = (repo / "project.yml").exists()
+
+              if pkg.exists():
+                  add_target({
+                      "name": repo.name,
+                      "repo_path": str(repo),
+                      "kind": "swiftpm",
+                      "platform": "macos",
+                      "weight": 10,
+                      "steps": ["resolve", "build", "test"]
+                  })
+
+              if has_project_yml:
+                  add_target({
+                      "name": repo.name,
+                      "repo_path": str(repo),
+                      "kind": "xcodegen",
+                      "platform": "ios",
+                      "weight": 70,
+                      "steps": ["generate", "ios_build", "ios_test"]
+                  })
+
+              for p in projs:
+                  add_target({
+                      "name": f"{repo.name}:{p.name}",
+                      "repo_path": str(repo),
+                      "project_path": str(p),
+                      "kind": "xcodeproj",
+                      "platform": "unknown",
+                      "weight": 30,
+                      "steps": ["discover_schemes"]
+                  })
+
+              for w in workspaces:
+                  add_target({
+                      "name": f"{repo.name}:{w.name}",
+                      "repo_path": str(repo),
+                      "workspace_path": str(w),
+                      "kind": "xcworkspace",
+                      "platform": "unknown",
+                      "weight": 35,
+                      "steps": ["discover_schemes"]
+                  })
+
+              if repo.name == "llama.cpp":
+                  add_target({
+                      "name": "llama.cpp:swiftui",
+                      "repo_path": str(repo),
+                      "kind": "bootstrap_xcframework",
+                      "platform": "ios",
+                      "weight": 90,
+                      "steps": ["bootstrap_xcframework", "ios_build"]
+                  })
+
+          out = Path("ci/results/manifest.json")
+          out.write_text(json.dumps({"targets": sorted(manifest, key=lambda x: (x["weight"], x["name"]))}, indent=2))
+          print(out.read_text())
+          PY
+
+      - name: Run progressive suite
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python3 <<'PY'
+          import json
+    import os
+          import subprocess
           import time
           from pathlib import Path
 
-          ROOT = Path(".").resolve()
-          OUT = ROOT / "ci_results"
-          LOGS = OUT / "logs"
-          META = OUT / "meta"
-          LOGS.mkdir(parents=True, exist_ok=True)
-          META.mkdir(parents=True, exist_ok=True)
-
-          SUMMARY_JSON = OUT / "summary.json"
-          SUMMARY_MD = OUT / "summary.md"
+          MANIFEST = Path("ci/results/manifest.json")
+          RESULTS_DIR = Path("ci/results")
+          LOGS_DIR = RESULTS_DIR / "logs"
+          DERIVED_ROOT = Path.home() / "Library/Developer/Xcode/DerivedData"
           STEP_SUMMARY = os.environ.get("GITHUB_STEP_SUMMARY")
 
-          PREFERRED_IOS_RUNTIMES = ["18.5", "18.6", "26.0", "26.1", "26.2"]
-          PREFERRED_IOS_DEVICE_NAMES = [
-              "iPhone 16 Pro",
-              "iPhone 16 Pro Max",
-              "iPhone 16",
-              "iPhone 16 Plus",
-              "iPhone 16e",
-              "iPhone 15 Pro",
-              "iPhone 15 Pro Max",
-              "iPhone 15",
-              "iPhone 14 Pro",
-              "iPhone 14",
-              "iPhone 17 Pro",
-              "iPhone 17 Pro Max",
-              "iPhone 17",
-              "iPhone Air",
-              "iPhone SE (3rd generation)",
-              "iPad Pro 13-inch (M5)",
-              "iPad Pro 11-inch (M5)",
-              "iPad Pro 13-inch (M4)",
-              "iPad Pro 11-inch (M4)",
-              "iPad Air 13-inch (M3)",
-              "iPad Air 11-inch (M3)",
-              "iPad Air 13-inch (M2)",
-              "iPad Air 11-inch (M2)",
-              "iPad mini (A17 Pro)",
-              "iPad (A16)",
-              "iPad (10th generation)",
-          ]
-
-          def run(cmd, cwd=None, timeout=None):
-              started = time.time()
-              try:
-                  proc = subprocess.run(
-                      cmd,
-                      cwd=cwd,
-                      stdout=subprocess.PIPE,
-                      stderr=subprocess.STDOUT,
-                      text=True,
-                      timeout=timeout,
-                  )
-                  return {
-                      "ok": proc.returncode == 0,
-                      "returncode": proc.returncode,
-                      "output": proc.stdout,
-                      "seconds": round(time.time() - started, 2),
-                      "exception": None,
-                  }
-              except Exception as e:
-                  return {
-                      "ok": False,
-                      "returncode": -1,
-                      "output": "",
-                      "seconds": round(time.time() - started, 2),
-                      "exception": repr(e),
-                  }
-
-          def write_text(path, text):
-              path.parent.mkdir(parents=True, exist_ok=True)
-              path.write_text(text, encoding="utf-8")
-
-          def append_text(path, text):
-              path.parent.mkdir(parents=True, exist_ok=True)
-              with path.open("a", encoding="utf-8") as f:
-                  f.write(text)
-
-          def sanitize(name):
-              return re.sub(r"[^A-Za-z0-9._-]+", "_", name)
-
-          def format_command(cmd):
-              return " ".join(shlex.quote(c) for c in cmd)
-
-          def extract_key_lines(text, limit=60):
-              patterns = [
-                  r"error: .*",
-                  r"fatal error: .*",
-                  r"\*\* BUILD FAILED \*\*",
-                  r"Testing failed:.*",
-                  r"Unable to find a destination matching.*",
-                  r"Ineligible destinations.*",
-                  r"no such module .*",
-                  r"ComputeTargetDependencyGraph",
-                  r"Package resolution failed.*",
-                  r"Could not resolve package dependencies.*",
-                  r"missing package product .*",
-                  r"error: Signing for .* requires a development team",
-                  r"error: No Accounts",
-                  r"error: .*provisioning.*",
-                  r"error: .*code signing.*",
-                  r"error: unable to load standard library for target .*",
-                  r"error: cannot find .* in scope",
-                  r"error: build input file cannot be found.*",
-                  r"error: linker command failed.*",
-                  r"Undefined symbols for architecture .*",
-              ]
-              hits = []
-              for line in text.splitlines():
-                  s = line.strip()
-                  for p in patterns:
-                      if re.search(p, s, flags=re.IGNORECASE):
-                          hits.append(s)
-                          break
-              dedup = []
-              seen = set()
-              for h in hits:
-                  if h not in seen:
-                      seen.add(h)
-                      dedup.append(h)
-              return dedup[:limit]
-
-          def discover_sim_names():
-              res = run(["xcrun", "simctl", "list", "-j"], timeout=300)
-              raw = res["output"] or "{}"
-              write_text(META / "simctl_list.json", raw)
-              try:
-                  data = json.loads(raw)
-              except Exception:
-                  return []
-
-              names = []
-              devices = data.get("devices", {})
-              for runtime_key, devs in devices.items():
-                  if "iOS" not in runtime_key:
-                      continue
-                  for d in devs:
-                      if d.get("isAvailable", False):
-                          n = d.get("name", "")
-                          if n and n not in names:
-                              names.append(n)
-
-              ordered = []
-              for preferred in PREFERRED_IOS_DEVICE_NAMES:
-                  if preferred in names:
-                      ordered.append(preferred)
-              for n in names:
-                  if n not in ordered:
-                      ordered.append(n)
-              return ordered
-
-          def classify_scheme(scheme):
-              s = scheme.lower()
+          def run_cmd(cmd, cwd=None, log_path=None):
+              start = time.time()
+              p = subprocess.run(cmd, cwd=cwd, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+              output = p.stdout
+              if log_path:
+                  Path(log_path).write_text(output)
               return {
-                  "likely_ios": any(k in s for k in ["ios", "iphone", "ipad", "mobile", "uikit"]),
-                  "likely_macos": any(k in s for k in ["mac", "osx", "appkit"]),
-                  "likely_tests": any(k in s for k in ["test", "tests", "uitest", "uitests"]),
+                  "returncode": p.returncode,
+                  "seconds": round(time.time() - start, 2),
+                  "output": output,
               }
 
-          def build_destinations(scheme, sim_names):
-              info = classify_scheme(scheme)
-              mac = ["platform=macOS,arch=arm64", "platform=macOS", "generic/platform=macOS"]
-              ios = []
-              for osver in PREFERRED_IOS_RUNTIMES:
-                  for name in sim_names:
-                      ios.append(f"platform=iOS Simulator,OS={osver},name={name}")
-              for name in sim_names:
-                  ios.append(f"platform=iOS Simulator,name={name}")
-              ios.extend(["generic/platform=iOS Simulator", "generic/platform=iOS"])
+          def top_lines(text, limit=8):
+              interesting = []
+              for line in text.splitlines():
+                  low = line.lower()
+                  if any(k in low for k in [
+                      "error:",
+                      "fatal",
+                      "failed",
+                      "no such module",
+                      "codesign",
+                      "signing",
+                      "test failed",
+                      "xcodebuild:",
+                      "unable to",
+                  ]):
+                      interesting.append(line.strip())
+              return interesting[:limit]
 
-              if info["likely_ios"] and not info["likely_macos"]:
-                  candidates = ios + mac
-              else:
-                  candidates = mac + ios
-
-              dedup = []
-              seen = set()
-              for c in candidates:
-                  if c not in seen:
-                      seen.add(c)
-                      dedup.append(c)
-              return dedup
-
-          def find_xcode_projects():
-              projects = []
-              for p in ROOT.rglob("*.xcodeproj"):
-                  s = str(p)
-                  if ".build/" in s or "SourcePackages/" in s or "/Pods/" in s:
-                      continue
-                  projects.append(p)
-              return sorted(set(projects))
-
-          def find_package_swifts():
-              pkgs = []
-              for p in ROOT.rglob("Package.swift"):
-                  s = str(p)
-                  if ".build/" in s or "SourcePackages/" in s:
-                      continue
-                  pkgs.append(p)
-              return sorted(set(pkgs))
-
-          def parse_schemes_from_list_output(output):
-              lines = output.splitlines()
-              schemes = []
-              in_schemes = False
-              for line in lines:
-                  if line.strip() == "Schemes:":
-                      in_schemes = True
-                      continue
-                  if in_schemes:
-                      if not line.strip():
-                          if schemes: break
-                          continue
-                      if line.startswith("        ") or line.startswith("    ") or line.startswith("\t"):
-                          schemes.append(line.strip())
-                      elif schemes:
-                          break
-              return schemes
-
-          def discover_targets():
-              targets = []
-              xcode_projects = find_xcode_projects()
-              package_swifts = find_package_swifts()
-
-              write_text(META / "discovered_xcodeproj.json", json.dumps([str(p) for p in xcode_projects], indent=2))
-              write_text(META / "discovered_packages.json", json.dumps([str(p) for p in package_swifts], indent=2))
-
-              for project in xcode_projects:
-                  list_cmd = ["xcodebuild", "-list", "-project", str(project)]
-                  res = run(list_cmd, timeout=300)
-                  write_text(LOGS / f"{sanitize(project.name)}_list.log", res["output"] + (("\nEXCEPTION:\n" + res["exception"]) if res["exception"] else ""))
-                  schemes = parse_schemes_from_list_output(res["output"])
-                  for scheme in schemes:
-                      targets.append({
-                          "kind": "xcodeproj",
-                          "root": str(project.parent),
-                          "project": str(project),
-                          "package_path": None,
-                          "scheme": scheme,
-                          "label": f"{project.stem}::{scheme}",
-                      })
-
-              for pkg in package_swifts:
-                  pkg_dir = pkg.parent
-                  list_cmd = ["xcodebuild", "-list", "-package-path", str(pkg_dir)]
-                  res = run(list_cmd, timeout=300)
-                  write_text(LOGS / f"{sanitize(pkg_dir.name)}_package_list.log", res["output"] + (("\nEXCEPTION:\n" + res["exception"]) if res["exception"] else ""))
-                  schemes = parse_schemes_from_list_output(res["output"])
-                  if not schemes:
-                      dump_res = run(["swift", "package", "dump-package"], cwd=str(pkg_dir), timeout=300)
-                      write_text(LOGS / f"{sanitize(pkg_dir.name)}_dump_package.log", dump_res["output"] + (("\nEXCEPTION:\n" + dump_res["exception"]) if dump_res["exception"] else ""))
-                  for scheme in schemes:
-                      targets.append({
-                          "kind": "package",
-                          "root": str(pkg_dir),
-                          "project": None,
-                          "package_path": str(pkg_dir),
-                          "scheme": scheme,
-                          "label": f"{pkg_dir.name}::{scheme}",
-                      })
-              return targets
-
-          def make_list_cmd(target):
-              if target["kind"] == "xcodeproj":
-                  return ["xcodebuild", "-list", "-project", target["project"]]
-              return ["xcodebuild", "-list", "-package-path", target["package_path"]]
-
-          def make_showdestinations_cmd(target):
-              if target["kind"] == "xcodeproj":
-                  return ["xcodebuild", "-project", target["project"], "-scheme", target["scheme"], "-showdestinations"]
-              return ["xcodebuild", "-package-path", target["package_path"], "-scheme", target["scheme"], "-showdestinations"]
-
-          def make_resolve_cmd(target):
-              if target["kind"] == "xcodeproj":
-                  return ["xcodebuild", "-resolvePackageDependencies", "-project", target["project"], "-scheme", target["scheme"]]
-              return ["xcodebuild", "-resolvePackageDependencies", "-package-path", target["package_path"], "-scheme", target["scheme"]]
-
-          def make_build_cmd(target, destination):
-              if target["kind"] == "xcodeproj":
-                  return ["xcodebuild", "-project", target["project"], "-scheme", target["scheme"], "-destination", destination, "clean", "build"]
-              return ["xcodebuild", "-package-path", target["package_path"], "-scheme", target["scheme"], "-destination", destination, "clean", "build"]
-
-          def make_test_cmd(target, destination):
-              if target["kind"] == "xcodeproj":
-                  return ["xcodebuild", "-project", target["project"], "-scheme", target["scheme"], "-destination", destination, "test"]
-              return ["xcodebuild", "-package-path", target["package_path"], "-scheme", target["scheme"], "-destination", destination, "test"]
-
-          sim_names = discover_sim_names()
-          targets = discover_targets()
-
-          if not targets:
-              msg = "No .xcodeproj or Package.swift schemes discovered."
-              write_text(SUMMARY_MD, msg + "\n")
+          def append_summary(md):
               if STEP_SUMMARY:
-                  append_text(Path(STEP_SUMMARY), "# Exhaustive Xcode Debug Summary\n\n- No `.xcodeproj` or `Package.swift` schemes discovered.\n")
-              print(msg)
-              sys.exit(1)
+                  with open(STEP_SUMMARY, "a", encoding="utf-8") as f:
+                      f.write(md)
+
+          with MANIFEST.open() as f:
+              targets = json.load(f)["targets"]
 
           results = []
-          for target in targets:
-              case_name = target["label"]
-              case_slug = sanitize(case_name)
-              case_dir = LOGS / case_slug
-              case_dir.mkdir(parents=True, exist_ok=True)
-              attempts = []
-              case_started = time.time()
+          sim_dest = "platform=iOS Simulator,name=iPhone 16"
 
-              # list
-              list_cmd = make_list_cmd(target)
-              list_res = run(list_cmd, timeout=300)
-              list_output = list_res["output"] + (("\nEXCEPTION:\n" + list_res["exception"]) if list_res["exception"] else "")
-              write_text(case_dir / "00_list.log", list_output)
-              attempts.append({
-                  "phase": "list", "action": "list", "destination": "", "status": "passed" if list_res["ok"] else "failed",
-                  "returncode": list_res["returncode"], "seconds": list_res["seconds"], "log": str(case_dir / "00_list.log"),
-                  "key_lines": extract_key_lines(list_output), "command": format_command(list_cmd),
-              })
+          for idx, target in enumerate(targets, start=1):
+              name = target["name"]
+              kind = target["kind"]
+              repo_path = target["repo_path"]
+              log_prefix = LOGS_DIR / f"{idx:02d}-{name.replace('/', '_').replace(':', '_')}"
 
-              # showdestinations
-              show_cmd = make_showdestinations_cmd(target)
-              show_res = run(show_cmd, timeout=300)
-              show_output = show_res["output"] + (("\nEXCEPTION:\n" + show_res["exception"]) if show_res["exception"] else "")
-              write_text(case_dir / "01_showdestinations.log", show_output)
-              attempts.append({
-                  "phase": "showdestinations", "action": "showdestinations", "destination": "", "status": "passed" if show_res["ok"] else "failed",
-                  "returncode": show_res["returncode"], "seconds": show_res["seconds"], "log": str(case_dir / "01_showdestinations.log"),
-                  "key_lines": extract_key_lines(show_output), "command": format_command(show_cmd),
-              })
+              record = {
+                  "name": name,
+                  "kind": kind,
+                  "status": "passed",
+                  "completed_steps": [],
+                  "skipped_steps": [],
+                  "failed_step": None,
+                  "top_issue": "",
+                  "seconds": 0.0,
+              }
 
-              # resolve
-              resolve_best_lines = []
-              for idx in range(1, 3):
-                  resolve_cmd = make_resolve_cmd(target)
-                  resolve_res = run(resolve_cmd, timeout=1800)
-                  resolve_output = resolve_res["output"] + (("\nEXCEPTION:\n" + resolve_res["exception"]) if resolve_res["exception"] else "")
-                  log_path = case_dir / f"02_resolve_try{idx}.log"
-                  write_text(log_path, resolve_output)
-                  key_lines = extract_key_lines(resolve_output)
-                  attempts.append({
-                      "phase": "resolvePackageDependencies", "action": "resolve", "destination": "", "status": "passed" if resolve_res["ok"] else "failed",
-                      "returncode": resolve_res["returncode"], "seconds": resolve_res["seconds"], "log": str(log_path),
-                      "key_lines": key_lines, "command": format_command(resolve_cmd),
-                  })
-                  if key_lines and not resolve_best_lines: resolve_best_lines = key_lines
-                  if resolve_res["ok"]: break
+              started = time.time()
 
-              destinations = build_destinations(target["scheme"], sim_names)
-              write_text(case_dir / "02_destination_candidates.json", json.dumps(destinations, indent=2))
+              def fail(step, output):
+                  record["status"] = "failed"
+                  record["failed_step"] = step
+                  keys = top_lines(output)
+                  record["top_issue"] = keys[0] if keys else "Unknown failure"
+                  return False
 
-              final_status, final_action, winning_destination, main_log, build_succeeded = "failed", "build", None, "", False
-              final_key_lines = []
+              if kind == "swiftpm":
+                  r = run_cmd(["swift", "package", "resolve"], cwd=repo_path, log_path=f"{log_prefix}-resolve.log")
+                  if r["returncode"] != 0:
+                      fail("resolve", r["output"])
+                  else:
+                      record["completed_steps"].append("resolve")
 
-              for d_index, destination in enumerate(destinations, start=1):
-                  for try_no in range(1, 3):
-                      build_cmd = make_build_cmd(target, destination)
-                      build_res = run(build_cmd, cwd=target["root"], timeout=5400)
-                      build_output = build_res["output"] + (("\nEXCEPTION:\n" + build_res["exception"]) if build_res["exception"] else "")
-                      log_path = case_dir / f"03_build_dest{d_index:03d}_try{try_no}.log"
-                      write_text(log_path, build_output)
-                      key_lines = extract_key_lines(build_output)
-                      attempts.append({
-                          "phase": "build", "action": "build", "destination": destination, "status": "passed" if build_res["ok"] else "failed",
-                          "returncode": build_res["returncode"], "seconds": build_res["seconds"], "log": str(log_path),
-                          "key_lines": key_lines, "command": format_command(build_cmd),
-                      })
-                      if build_res["ok"]:
-                          build_succeeded, final_status, winning_destination, main_log, final_key_lines = True, "passed", destination, str(log_path), key_lines
-                          break
-                      if not final_key_lines and key_lines:
-                          final_key_lines, main_log = key_lines, str(log_path)
-                      if any(("Unable to find a destination matching" in k) or ("Ineligible destinations" in k) for k in key_lines):
-                          break
-                  if build_succeeded: break
-
-              if build_succeeded and winning_destination:
-                  for try_no in range(1, 3):
-                      test_cmd = make_test_cmd(target, winning_destination)
-                      test_res = run(test_cmd, cwd=target["root"], timeout=5400)
-                      test_output = test_res["output"] + (("\nEXCEPTION:\n" + test_res["exception"]) if test_res["exception"] else "")
-                      log_path = case_dir / f"04_test_try{try_no}.log"
-                      write_text(log_path, test_output)
-                      key_lines = extract_key_lines(test_output)
-                      attempts.append({
-                          "phase": "test", "action": "test", "destination": winning_destination, "status": "passed" if test_res["ok"] else "failed",
-                          "returncode": test_res["returncode"], "seconds": test_res["seconds"], "log": str(log_path),
-                          "key_lines": key_lines, "command": format_command(test_cmd),
-                      })
-                      if test_res["ok"]:
-                          final_status, final_action, main_log = "passed", "test", str(log_path)
-                          if key_lines: final_key_lines = key_lines
-                          break
+                  if record["status"] == "passed":
+                      r = run_cmd(["swift", "build"], cwd=repo_path, log_path=f"{log_prefix}-build.log")
+                      if r["returncode"] != 0:
+                          fail("build", r["output"])
                       else:
-                          final_status, final_action, main_log = "failed", "test", str(log_path)
-                          if key_lines: final_key_lines = key_lines
+                          record["completed_steps"].append("build")
 
-              if not final_key_lines: final_key_lines = resolve_best_lines
-              results.append({
-                  "case_name": case_name, "kind": target["kind"], "project": target["project"], "package_path": target["package_path"],
-                  "scheme": target["scheme"], "attempts": attempts, "winning_destination": winning_destination,
-                  "final_status": final_status, "final_action": final_action, "final_key_lines": final_key_lines,
-                  "main_log": main_log, "total_seconds": round(time.time() - case_started, 2),
-              })
+                  if record["status"] == "passed":
+                      r = run_cmd(["swift", "test"], cwd=repo_path, log_path=f"{log_prefix}-test.log")
+                      if r["returncode"] != 0:
+                          fail("test", r["output"])
+                      else:
+                          record["completed_steps"].append("test")
 
-          payload = {"targets": targets, "results": results}
-          write_text(SUMMARY_JSON, json.dumps(payload, indent=2))
-          lines = ["# Exhaustive Xcode Debug Summary", "", f"- Targets discovered: **{len(targets)}**", f"- iOS simulators discovered: **{len(sim_names)}**", "", "| Case | Kind | Final status | Final action | Winning destination | Duration (s) | Top issue |", "|---|---|---|---|---|---:|---|"]
-          passed = failed = 0
+              elif kind == "xcodegen":
+                  r = run_cmd(["xcodegen", "generate"], cwd=repo_path, log_path=f"{log_prefix}-generate.log")
+                  if r["returncode"] != 0:
+                      fail("generate", r["output"])
+                  else:
+                      record["completed_steps"].append("generate")
+
+                  if record["status"] == "passed":
+                      r = run_cmd([
+                          "xcodebuild",
+                          "-project", "BisonAI.xcodeproj",
+                          "-scheme", "BisonAI",
+                          "-destination", sim_dest,
+                          "-derivedDataPath", str(DERIVED_ROOT / "bisonai"),
+                          "CODE_SIGNING_ALLOWED=NO",
+                          "build"
+                      ], cwd=repo_path, log_path=f"{log_prefix}-ios-build.log")
+                      if r["returncode"] != 0:
+                          fail("ios_build", r["output"])
+                      else:
+                          record["completed_steps"].append("ios_build")
+
+                  if record["status"] == "passed":
+                      r = run_cmd([
+                          "xcodebuild",
+                          "-project", "BisonAI.xcodeproj",
+                          "-scheme", "BisonAI",
+                          "-destination", sim_dest,
+                          "-derivedDataPath", str(DERIVED_ROOT / "bisonai"),
+                          "CODE_SIGNING_ALLOWED=NO",
+                          "test"
+                      ], cwd=repo_path, log_path=f"{log_prefix}-ios-test.log")
+                      if r["returncode"] != 0:
+                          fail("ios_test", r["output"])
+                      else:
+                          record["completed_steps"].append("ios_test")
+
+              elif kind == "bootstrap_xcframework":
+                  r = run_cmd(["./build-xcframework.sh"], cwd=repo_path, log_path=f"{log_prefix}-bootstrap.log")
+                  if r["returncode"] != 0:
+                      fail("bootstrap_xcframework", r["output"])
+                  else:
+                      record["completed_steps"].append("bootstrap_xcframework")
+
+                  if record["status"] == "passed":
+                      r = run_cmd([
+                          "xcodebuild",
+                          "-project", "examples/llama.swiftui/llama.swiftui.xcodeproj",
+                          "-scheme", "llama.swiftui",
+                          "-destination", sim_dest,
+                          "-derivedDataPath", str(DERIVED_ROOT / "llama_swiftui"),
+                          "CODE_SIGNING_ALLOWED=NO",
+                          "build"
+                      ], cwd=repo_path, log_path=f"{log_prefix}-ios-build.log")
+                      if r["returncode"] != 0:
+                          fail("ios_build", r["output"])
+                      else:
+                          record["completed_steps"].append("ios_build")
+
+              elif kind in ("xcodeproj", "xcworkspace"):
+                  scheme_list_cmd = ["xcodebuild", "-list"]
+                  if kind == "xcodeproj":
+                      scheme_list_cmd += ["-project", target["project_path"]]
+                  else:
+                      scheme_list_cmd += ["-workspace", target["workspace_path"]]
+
+                  r = run_cmd(scheme_list_cmd, cwd=repo_path, log_path=f"{log_prefix}-discover-schemes.log")
+                  if r["returncode"] != 0:
+                      fail("discover_schemes", r["output"])
+                  else:
+                      record["completed_steps"].append("discover_schemes")
+
+              record["seconds"] = round(time.time() - started, 2)
+              results.append(record)
+
+          summary = []
+          summary.append("# Progressive Xcode LLM Test Summary")
+          summary.append("")
+          summary.append("| Target | Kind | Status | Failed step | Completed steps | Seconds | Top issue |")
+          summary.append("|---|---|---|---|---|---:|---|")
+
+          failures = 0
           for r in results:
-              if r["final_status"] == "passed": passed += 1
-              else: failed += 1
-              top_issue = r["final_key_lines"][0].replace("|", "\\|") if r["final_key_lines"] else ""
-              lines.append(f"| {r['case_name']} | {r['kind']} | {r['final_status']} | {r['final_action']} | {(r['winning_destination'] or '').replace('|', '/')} | {r['total_seconds']:.2f} | {top_issue} |")
+              if r["status"] != "passed":
+                  failures += 1
+              summary.append(
+                  f"| {r['name']} | {r['kind']} | {r['status']} | {r['failed_step'] or ''} | {', '.join(r['completed_steps'])} | {r['seconds']:.2f} | {r['top_issue'].replace('|', '/')} |"
+              )
 
-          summary_md = "\n".join(lines) + "\n"
-          write_text(SUMMARY_MD, summary_md)
-          if STEP_SUMMARY: append_text(Path(STEP_SUMMARY), summary_md)
-          sys.exit(1 if failed > 0 else 0)
+          summary_text = "\n".join(summary) + "\n"
+          (RESULTS_DIR / "summary.json").write_text(json.dumps(results, indent=2))
+          (RESULTS_DIR / "summary.md").write_text(summary_text)
+          append_summary(summary_text)
+
+          raise SystemExit(1 if failures else 0)
           PY
 
-      - name: Upload exhaustive debug artifacts
+      - name: Upload suite artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: exhaustive-xcode-debug-results
-          path: ci_results
-          retention-days: 14
+          name: progressive-xcode-llm-results
+          path: ci/results
+          if-no-files-found: ignore
