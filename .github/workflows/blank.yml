@@ -1,4 +1,4 @@
-name: Exhaustive Xcode Debug Suite
+name: Exhaustive Xcode Debug Suite (Ultra Verbose, Environment Targeted)
 
 on:
   push:
@@ -8,19 +8,34 @@ on:
 jobs:
   exhaustive-debug:
     runs-on: macos-15
-    timeout-minutes: 120
+    timeout-minutes: 180
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Environment snapshot
+      - name: Pin Xcode 16.4
         shell: bash
         run: |
           set +e
-          mkdir -p ci_results/logs ci_results/meta
+          sudo xcode-select -s /Applications/Xcode_16.4.app/Contents/Developer
+          echo "Selected developer dir:"
+          xcode-select -p
+          echo
+          echo "Xcode version:"
+          xcodebuild -version
+          echo
+          echo "Swift version:"
+          swift --version
+
+      - name: Capture ultra verbose environment
+        shell: bash
+        run: |
+          set +e
+          mkdir -p ci_results/meta ci_results/logs
+
           {
-            echo "## Environment"
+            echo "# Environment Snapshot"
             echo
             echo '```'
             echo "DATE: $(date)"
@@ -36,17 +51,26 @@ jobs:
             echo
             xcode-select -p || true
             echo
+            echo "== SDKs =="
             xcodebuild -showsdks || true
             echo
+            echo "== Runtimes =="
             xcrun simctl list runtimes || true
             echo
+            echo "== Available Devices =="
             xcrun simctl list devices available || true
+            echo
+            echo "== Device Types =="
+            xcrun simctl list devicetypes || true
+            echo
+            echo "== Installed Simulators JSON =="
+            xcrun simctl list -j || true
             echo '```'
           } | tee ci_results/meta/environment.md
 
           cat ci_results/meta/environment.md >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Run exhaustive suite
+      - name: Run exhaustive environment-targeted suite
         shell: bash
         run: |
           set +e
@@ -65,29 +89,91 @@ jobs:
           OUT = ROOT / "ci_results"
           LOGS = OUT / "logs"
           META = OUT / "meta"
+
           LOGS.mkdir(parents=True, exist_ok=True)
           META.mkdir(parents=True, exist_ok=True)
 
           SUMMARY_JSON = OUT / "summary.json"
           SUMMARY_MD = OUT / "summary.md"
-
           STEP_SUMMARY = os.environ.get("GITHUB_STEP_SUMMARY")
 
-          TEST_ACTIONS = ["build", "test"]
+          XCODE_PATH = "/Applications/Xcode_16.4.app/Contents/Developer"
 
-          FALLBACK_DESTINATIONS = [
-              "platform=macOS,arch=arm64",
-              "platform=macOS,arch=x86_64",
-              "platform=macOS",
-              "generic/platform=macOS",
-              "platform=iOS Simulator,OS=latest,name=iPhone 16",
-              "platform=iOS Simulator,OS=latest,name=iPhone 15",
-              "platform=iOS Simulator,OS=latest,name=iPhone 14",
-              "platform=iOS Simulator,name=iPhone 16",
-              "platform=iOS Simulator,name=iPhone 15",
-              "platform=iOS Simulator,name=iPhone 14",
-              "generic/platform=iOS Simulator",
-              "generic/platform=iOS",
+          # Environment-specific preferences based on your posted runner.
+          # Prefer modern available runtimes, but still keep 18.5 high because it is the SDK baseline shown.
+          PREFERRED_IOS_RUNTIMES = [
+              "iOS 18.5",
+              "iOS 18.6",
+              "iOS 26.0",
+              "iOS 26.1",
+              "iOS 26.2",
+          ]
+
+          PREFERRED_TVOS_RUNTIMES = [
+              "tvOS 18.5",
+              "tvOS 26.1",
+              "tvOS 26.2",
+          ]
+
+          PREFERRED_WATCHOS_RUNTIMES = [
+              "watchOS 11.5",
+              "watchOS 26.1",
+              "watchOS 26.2",
+          ]
+
+          PREFERRED_VISIONOS_RUNTIMES = [
+              "visionOS 2.5",
+              "visionOS 2.4",
+              "visionOS 2.3",
+              "visionOS 26.1",
+              "visionOS 26.2",
+          ]
+
+          PREFERRED_IOS_DEVICE_NAMES = [
+              "iPhone 16 Pro",
+              "iPhone 16 Pro Max",
+              "iPhone 16",
+              "iPhone 16 Plus",
+              "iPhone 16e",
+              "iPhone 15 Pro",
+              "iPhone 15 Pro Max",
+              "iPhone 15",
+              "iPhone 14 Pro",
+              "iPhone 14",
+              "iPhone 17 Pro",
+              "iPhone 17 Pro Max",
+              "iPhone 17",
+              "iPhone Air",
+              "iPhone SE (3rd generation)",
+              "iPad Pro 13-inch (M5)",
+              "iPad Pro 11-inch (M5)",
+              "iPad Pro 13-inch (M4)",
+              "iPad Pro 11-inch (M4)",
+              "iPad Air 13-inch (M3)",
+              "iPad Air 11-inch (M3)",
+              "iPad Air 13-inch (M2)",
+              "iPad Air 11-inch (M2)",
+              "iPad mini (A17 Pro)",
+              "iPad (A16)",
+              "iPad (10th generation)",
+          ]
+
+          PREFERRED_TV_DEVICE_NAMES = [
+              "Apple TV 4K (3rd generation)",
+              "Apple TV 4K (3rd generation) (at 1080p)",
+              "Apple TV",
+          ]
+
+          PREFERRED_WATCH_DEVICE_NAMES = [
+              "Apple Watch Series 10 (46mm)",
+              "Apple Watch Series 10 (42mm)",
+              "Apple Watch Ultra 2 (49mm)",
+              "Apple Watch SE (44mm) (2nd generation)",
+              "Apple Watch SE (40mm) (2nd generation)",
+          ]
+
+          PREFERRED_VISION_DEVICE_NAMES = [
+              "Apple Vision Pro",
           ]
 
           def run(cmd, cwd=None, timeout=None):
@@ -129,7 +215,7 @@ jobs:
           def sanitize(name):
               return re.sub(r"[^A-Za-z0-9._-]+", "_", name)
 
-          def extract_key_lines(text, limit=25):
+          def extract_key_lines(text, limit=60):
               patterns = [
                   r"error: .*",
                   r"fatal error: .*",
@@ -140,7 +226,21 @@ jobs:
                   r"no such module .*",
                   r"ComputeTargetDependencyGraph",
                   r"Package resolution failed.*",
-                  r"Process completed with exit code \d+",
+                  r"Could not resolve package dependencies.*",
+                  r"missing package product .*",
+                  r"error: Signing for .* requires a development team",
+                  r"error: No Accounts",
+                  r"error: .*provisioning.*",
+                  r"error: .*code signing.*",
+                  r"error: unable to load standard library for target .*",
+                  r"error: cannot find .* in scope",
+                  r"error: build input file cannot be found.*",
+                  r"error: linker command failed.*",
+                  r"ld: .*",
+                  r"Undefined symbols for architecture .*",
+                  r"ModuleCache.*",
+                  r"swift-frontend.*error.*",
+                  r"Process completed with exit code .*",
               ]
               hits = []
               for line in text.splitlines():
@@ -149,26 +249,32 @@ jobs:
                       if re.search(p, s, flags=re.IGNORECASE):
                           hits.append(s)
                           break
-              dedup = []
+              deduped = []
               seen = set()
               for h in hits:
                   if h not in seen:
                       seen.add(h)
-                      dedup.append(h)
-              return dedup[:limit]
+                      deduped.append(h)
+              return deduped[:limit]
+
+          def format_command(cmd):
+              return " ".join(shlex.quote(c) for c in cmd)
 
           def find_projects():
               projects = []
               for p in ROOT.rglob("*.xcodeproj"):
-                  if ".build/" in str(p) or "SourcePackages/" in str(p):
+                  s = str(p)
+                  if ".build/" in s:
+                      continue
+                  if "SourcePackages/" in s:
+                      continue
+                  if "/Pods/" in s:
                       continue
                   projects.append(p)
               return sorted(set(projects))
 
-          def parse_schemes(project):
-              res = run(["xcodebuild", "-list", "-project", str(project)], timeout=300)
-              text = (res["output"] or "") + ("\n" + (res["exception"] or "") if res["exception"] else "")
-              lines = text.splitlines()
+          def parse_schemes_from_list_output(output):
+              lines = output.splitlines()
               schemes = []
               in_schemes = False
               for line in lines:
@@ -184,66 +290,210 @@ jobs:
                           schemes.append(line.strip())
                       elif schemes:
                           break
-              return schemes, text, res["ok"]
+              return schemes
 
-          def parse_destinations(output):
-              dests = []
+          def parse_showdestinations_lines(output):
+              entries = []
               for line in output.splitlines():
                   s = line.strip()
                   if s.startswith("{") and s.endswith("}"):
-                      dests.append(s)
-              return dests
+                      entries.append(s)
+              return entries
+
+          def discover_simctl_json():
+              res = run(["xcrun", "simctl", "list", "-j"], timeout=300)
+              raw = res["output"] or ""
+              write_text(META / "simctl_list_raw.json", raw)
+              try:
+                  return json.loads(raw)
+              except Exception:
+                  return {}
+
+          def discover_runtime_device_map(simctl_json):
+              runtime_map = {}
+              devices = simctl_json.get("devices", {})
+
+              for runtime_key, device_entries in devices.items():
+                  pretty_runtime = runtime_key
+                  pretty_runtime = pretty_runtime.replace("com.apple.CoreSimulator.SimRuntime.", "")
+                  pretty_runtime = pretty_runtime.replace("iOS-", "iOS ")
+                  pretty_runtime = pretty_runtime.replace("tvOS-", "tvOS ")
+                  pretty_runtime = pretty_runtime.replace("watchOS-", "watchOS ")
+                  pretty_runtime = pretty_runtime.replace("xrOS-", "visionOS ")
+                  pretty_runtime = pretty_runtime.replace("-", ".")
+
+                  runtime_map[pretty_runtime] = []
+                  for d in device_entries:
+                      if d.get("isAvailable", False):
+                          runtime_map[pretty_runtime].append({
+                              "name": d.get("name", ""),
+                              "udid": d.get("udid", ""),
+                              "state": d.get("state", ""),
+                          })
+
+              return runtime_map
+
+          def collect_names_for_runtimes(runtime_map, preferred_runtimes, preferred_names):
+              found = []
+              for runtime in preferred_runtimes:
+                  for dev in runtime_map.get(runtime, []):
+                      if dev["name"] not in found:
+                          found.append(dev["name"])
+
+              ordered = []
+              for preferred in preferred_names:
+                  if preferred in found and preferred not in ordered:
+                      ordered.append(preferred)
+
+              for name in found:
+                  if name not in ordered:
+                      ordered.append(name)
+
+              return ordered
 
           def classify_scheme(scheme):
               s = scheme.lower()
-              wants_test = any(k in s for k in ["test", "tests", "uitest", "uitests"])
-              likely_ios = any(k in s for k in ["ios", "iphone", "ipad"])
-              likely_macos = any(k in s for k in ["mac", "osx"])
+
+              likely_ios = any(k in s for k in [
+                  "ios", "iphone", "ipad", "mobile", "uikit"
+              ])
+
+              likely_macos = any(k in s for k in [
+                  "mac", "osx", "appkit"
+              ])
+
+              likely_tvos = any(k in s for k in [
+                  "tvos", "appletv", "tv"
+              ])
+
+              likely_watchos = any(k in s for k in [
+                  "watch", "watchos"
+              ])
+
+              likely_visionos = any(k in s for k in [
+                  "vision", "visionos", "xros", "xr"
+              ])
+
+              likely_test_bundle = any(k in s for k in [
+                  "test", "tests", "uitest", "uitests"
+              ])
+
+              likely_example = any(k in s for k in [
+                  "example", "examples", "sample", "samples", "demo", "basic"
+              ])
+
               return {
-                  "wants_test": wants_test,
                   "likely_ios": likely_ios,
                   "likely_macos": likely_macos,
+                  "likely_tvos": likely_tvos,
+                  "likely_watchos": likely_watchos,
+                  "likely_visionos": likely_visionos,
+                  "likely_test_bundle": likely_test_bundle,
+                  "likely_example": likely_example,
               }
 
-          def prioritized_destinations(scheme):
+          def build_destination_candidates(scheme, runtime_map):
               info = classify_scheme(scheme)
-              dests = FALLBACK_DESTINATIONS[:]
-              if info["likely_ios"]:
-                  preferred = [
-                      "platform=iOS Simulator,OS=latest,name=iPhone 16",
-                      "platform=iOS Simulator,OS=latest,name=iPhone 15",
-                      "platform=iOS Simulator,OS=latest,name=iPhone 14",
-                      "platform=iOS Simulator,name=iPhone 16",
-                      "platform=iOS Simulator,name=iPhone 15",
-                      "platform=iOS Simulator,name=iPhone 14",
-                      "generic/platform=iOS Simulator",
-                      "generic/platform=iOS",
-                      "platform=macOS,arch=arm64",
-                      "platform=macOS",
-                  ]
-                  return preferred
-              if info["likely_macos"]:
-                  preferred = [
-                      "platform=macOS,arch=arm64",
-                      "platform=macOS,arch=x86_64",
-                      "platform=macOS",
-                      "generic/platform=macOS",
-                      "platform=iOS Simulator,OS=latest,name=iPhone 16",
-                      "generic/platform=iOS Simulator",
-                  ]
-                  return preferred
-              return dests
 
-          def choose_actions(scheme):
-              info = classify_scheme(scheme)
-              if info["wants_test"]:
-                  return ["build", "test"]
+              ios_names = collect_names_for_runtimes(runtime_map, PREFERRED_IOS_RUNTIMES, PREFERRED_IOS_DEVICE_NAMES)
+              tv_names = collect_names_for_runtimes(runtime_map, PREFERRED_TVOS_RUNTIMES, PREFERRED_TV_DEVICE_NAMES)
+              watch_names = collect_names_for_runtimes(runtime_map, PREFERRED_WATCHOS_RUNTIMES, PREFERRED_WATCH_DEVICE_NAMES)
+              vision_names = collect_names_for_runtimes(runtime_map, PREFERRED_VISIONOS_RUNTIMES, PREFERRED_VISION_DEVICE_NAMES)
+
+              mac_dests = [
+                  "platform=macOS,arch=arm64",
+                  "platform=macOS",
+                  "generic/platform=macOS",
+              ]
+
+              ios_dests = []
+              for runtime in PREFERRED_IOS_RUNTIMES:
+                  for name in ios_names:
+                      ios_dests.append(f"platform=iOS Simulator,OS={runtime.split(' ', 1)[1]},name={name}")
+              for name in ios_names:
+                  ios_dests.append(f"platform=iOS Simulator,name={name}")
+              ios_dests.extend([
+                  "generic/platform=iOS Simulator",
+                  "generic/platform=iOS",
+              ])
+
+              tv_dests = []
+              for runtime in PREFERRED_TVOS_RUNTIMES:
+                  for name in tv_names:
+                      tv_dests.append(f"platform=tvOS Simulator,OS={runtime.split(' ', 1)[1]},name={name}")
+              for name in tv_names:
+                  tv_dests.append(f"platform=tvOS Simulator,name={name}")
+              tv_dests.extend([
+                  "generic/platform=tvOS Simulator",
+                  "generic/platform=tvOS",
+              ])
+
+              watch_dests = []
+              for runtime in PREFERRED_WATCHOS_RUNTIMES:
+                  for name in watch_names:
+                      watch_dests.append(f"platform=watchOS Simulator,OS={runtime.split(' ', 1)[1]},name={name}")
+              for name in watch_names:
+                  watch_dests.append(f"platform=watchOS Simulator,name={name}")
+              watch_dests.extend([
+                  "generic/platform=watchOS Simulator",
+                  "generic/platform=watchOS",
+              ])
+
+              vision_dests = []
+              for runtime in PREFERRED_VISIONOS_RUNTIMES:
+                  for name in vision_names:
+                      version = runtime.split(" ", 1)[1]
+                      vision_dests.append(f"platform=visionOS Simulator,OS={version},name={name}")
+              for name in vision_names:
+                  vision_dests.append(f"platform=visionOS Simulator,name={name}")
+              vision_dests.extend([
+                  "generic/platform=visionOS Simulator",
+                  "generic/platform=visionOS",
+              ])
+
+              candidates = []
+
+              if info["likely_ios"] and not info["likely_macos"]:
+                  candidates.extend(ios_dests)
+                  candidates.extend(mac_dests)
+              elif info["likely_tvos"]:
+                  candidates.extend(tv_dests)
+                  candidates.extend(mac_dests)
+              elif info["likely_watchos"]:
+                  candidates.extend(watch_dests)
+                  candidates.extend(ios_dests)
+                  candidates.extend(mac_dests)
+              elif info["likely_visionos"]:
+                  candidates.extend(vision_dests)
+                  candidates.extend(mac_dests)
+              else:
+                  candidates.extend(mac_dests)
+                  candidates.extend(ios_dests)
+                  candidates.extend(tv_dests)
+                  candidates.extend(vision_dests)
+                  candidates.extend(watch_dests)
+
+              deduped = []
+              seen = set()
+              for c in candidates:
+                  if c not in seen:
+                      seen.add(c)
+                      deduped.append(c)
+
+              return deduped
+
+          def choose_actions_for_scheme(scheme):
+              # For debugging, always try build first.
+              # Then try test as a second phase if build succeeded.
               return ["build", "test"]
 
-          def format_command(cmd):
-              return " ".join(shlex.quote(c) for c in cmd)
+          def summarize_runtime_map(runtime_map):
+              lines = []
+              for runtime, devices in sorted(runtime_map.items()):
+                  lines.append(f"{runtime}: {len(devices)} device(s)")
+              return "\n".join(lines)
 
-          def write_summary(results, projects_meta):
+          def write_summary(results, projects_meta, runtime_map):
               total_cases = len(results)
               passed_cases = sum(1 for r in results if r["final_status"] == "passed")
               failed_cases = total_cases - passed_cases
@@ -251,14 +501,29 @@ jobs:
               lines = []
               lines.append("# Exhaustive Xcode Debug Summary")
               lines.append("")
+              lines.append("## Environment targeting")
+              lines.append("")
+              lines.append(f"- Xcode path: `{XCODE_PATH}`")
+              lines.append("- Runner OS: `macOS`")
+              lines.append("- Runner arch: `ARM64`")
+              lines.append("- Preferred macOS target: `platform=macOS,arch=arm64`")
+              lines.append("- Preferred iOS runtimes: `18.5`, `18.6`, `26.0`, `26.1`, `26.2`")
+              lines.append("- Preferred macOS SDK: `macOS 15.5`")
+              lines.append("")
+              lines.append("### Runtime/device inventory summary")
+              lines.append("")
+              lines.append("```")
+              lines.append(summarize_runtime_map(runtime_map))
+              lines.append("```")
+              lines.append("")
               lines.append(f"- Projects discovered: **{len(projects_meta)}**")
               lines.append(f"- Cases run: **{total_cases}**")
               lines.append(f"- Passed: **{passed_cases}**")
               lines.append(f"- Failed: **{failed_cases}**")
               lines.append("")
-              lines.append("## Cases")
+              lines.append("## Final case table")
               lines.append("")
-              lines.append("| Case | Final status | Action | Winning destination | Duration (s) | Top issue |")
+              lines.append("| Case | Final status | Final action | Winning destination | Duration (s) | Top issue |")
               lines.append("|---|---|---|---|---:|---|")
 
               for r in results:
@@ -267,11 +532,11 @@ jobs:
                       top_issue = r["final_key_lines"][0].replace("|", "\\|")
                   lines.append(
                       f"| {r['case_name']} | {r['final_status']} | {r['final_action']} | "
-                      f"{(r['winning_destination'] or '').replace('|','/')} | {r['total_seconds']:.2f} | {top_issue} |"
+                      f"{(r['winning_destination'] or '').replace('|', '/')} | {r['total_seconds']:.2f} | {top_issue} |"
                   )
 
               lines.append("")
-              lines.append("## Detailed results")
+              lines.append("## Detailed cases")
               lines.append("")
 
               for r in results:
@@ -280,24 +545,35 @@ jobs:
                   lines.append(f"- Project: `{r['project']}`")
                   lines.append(f"- Scheme: `{r['scheme']}`")
                   lines.append(f"- Final status: **{r['final_status']}**")
-                  lines.append(f"- Action: `{r['final_action']}`")
+                  lines.append(f"- Final action: `{r['final_action']}`")
                   lines.append(f"- Winning destination: `{r['winning_destination']}`")
-                  lines.append(f"- Duration: `{r['total_seconds']:.2f}s`")
-                  lines.append(f"- Log file: `{r['main_log']}`")
+                  lines.append(f"- Total duration: `{r['total_seconds']:.2f}s`")
+                  lines.append(f"- Main log: `{r['main_log']}`")
                   lines.append("")
-                  lines.append("Top extracted lines:")
+
+                  lines.append("#### Extracted highlights")
                   if r["final_key_lines"]:
-                      for item in r["final_key_lines"][:10]:
+                      for item in r["final_key_lines"][:20]:
                           lines.append(f"- {item}")
                   else:
                       lines.append("- None")
                   lines.append("")
-                  lines.append("Attempts:")
+
+                  lines.append("#### Attempt history")
                   for a in r["attempts"]:
-                      lines.append(
-                          f"- `{a['phase']}` / `{a['action']}` / `{a['destination']}` -> "
-                          f"`{a['status']}` in `{a['seconds']:.2f}s`"
-                      )
+                      lines.append(f"- Phase: `{a['phase']}`")
+                      lines.append(f"  - Action: `{a['action']}`")
+                      lines.append(f"  - Destination: `{a['destination']}`")
+                      lines.append(f"  - Status: `{a['status']}`")
+                      lines.append(f"  - Return code: `{a['returncode']}`")
+                      lines.append(f"  - Duration: `{a['seconds']:.2f}s`")
+                      lines.append(f"  - Log: `{a['log']}`")
+                      lines.append(f"  - Command: `{a['command']}`")
+                      if a["key_lines"]:
+                          lines.append("  - Key lines:")
+                          for item in a["key_lines"][:8]:
+                              lines.append(f"    - {item}")
+                      lines.append("")
                   lines.append("")
 
               md = "\n".join(lines) + "\n"
@@ -305,41 +581,41 @@ jobs:
               if STEP_SUMMARY:
                   append_text(Path(STEP_SUMMARY), md)
 
+          simctl_json = discover_simctl_json()
+          runtime_map = discover_runtime_device_map(simctl_json)
+          write_text(META / "runtime_device_map.json", json.dumps(runtime_map, indent=2))
+
           projects = find_projects()
-          projects_meta = []
           results = []
+          projects_meta = []
 
           if not projects:
-              msg = "No .xcodeproj files found."
-              write_text(OUT / "summary.md", msg + "\n")
+              msg = "No .xcodeproj files discovered."
+              write_text(SUMMARY_MD, msg + "\n")
               if STEP_SUMMARY:
-                  append_text(Path(STEP_SUMMARY), "# Exhaustive Xcode Debug Summary\n\n- No `.xcodeproj` files found.\n")
+                  append_text(Path(STEP_SUMMARY), "# Exhaustive Xcode Debug Summary\n\n- No `.xcodeproj` files discovered.\n")
               print(msg)
               sys.exit(1)
 
           for project in projects:
-              project_name = project.name
-              proj_slug = sanitize(project_name)
+              proj_slug = sanitize(project.name)
               proj_dir = LOGS / proj_slug
               proj_dir.mkdir(parents=True, exist_ok=True)
 
-              list_res = run(["xcodebuild", "-list", "-project", str(project)], timeout=300)
-              write_text(proj_dir / "00_list.log", list_res["output"] + (("\nEXCEPTION:\n" + list_res["exception"]) if list_res["exception"] else ""))
+              list_cmd = ["xcodebuild", "-list", "-project", str(project)]
+              list_res = run(list_cmd, timeout=300)
+              list_output = list_res["output"] + (("\nEXCEPTION:\n" + list_res["exception"]) if list_res["exception"] else "")
+              write_text(proj_dir / "00_xcodebuild_list.log", list_output)
 
-              schemes, parsed_text, list_ok = parse_schemes(project)
-              if not schemes:
-                  projects_meta.append({
-                      "project": str(project),
-                      "schemes": [],
-                      "list_ok": list_ok,
-                  })
-                  continue
-
+              schemes = parse_schemes_from_list_output(list_output)
               projects_meta.append({
                   "project": str(project),
                   "schemes": schemes,
-                  "list_ok": list_ok,
+                  "list_ok": list_res["ok"],
               })
+
+              if not schemes:
+                  continue
 
               for scheme in schemes:
                   case_name = f"{project.stem}::{scheme}"
@@ -350,155 +626,203 @@ jobs:
                   attempts = []
                   case_started = time.time()
 
-                  # Phase 1: showdestinations
+                  # Phase 1: show destinations
                   show_cmd = ["xcodebuild", "-project", str(project), "-scheme", scheme, "-showdestinations"]
                   show_res = run(show_cmd, timeout=300)
-                  show_log = case_dir / "01_showdestinations.log"
-                  write_text(show_log, show_res["output"] + (("\nEXCEPTION:\n" + show_res["exception"]) if show_res["exception"] else ""))
-                  show_dests = parse_destinations(show_res["output"])
+                  show_output = show_res["output"] + (("\nEXCEPTION:\n" + show_res["exception"]) if show_res["exception"] else "")
+                  write_text(case_dir / "01_showdestinations.log", show_output)
+                  show_entries = parse_showdestinations_lines(show_output)
 
                   attempts.append({
                       "phase": "showdestinations",
                       "action": "showdestinations",
                       "destination": "",
                       "status": "passed" if show_res["ok"] else "failed",
-                      "seconds": show_res["seconds"],
                       "returncode": show_res["returncode"],
-                      "log": str(show_log),
-                      "key_lines": extract_key_lines(show_res["output"]),
+                      "seconds": show_res["seconds"],
+                      "log": str(case_dir / "01_showdestinations.log"),
+                      "key_lines": extract_key_lines(show_output),
                       "command": format_command(show_cmd),
                   })
 
-                  # Phase 2: resolve packages (with retry)
+                  write_text(case_dir / "01_showdestinations_parsed.json", json.dumps(show_entries, indent=2))
+
+                  # Phase 2: resolve packages, with multiple retries and a cache-clean fallback
                   resolve_ok = False
                   resolve_best_lines = []
-                  for idx in range(1, 3):
-                      resolve_cmd = ["xcodebuild", "-resolvePackageDependencies", "-project", str(project), "-scheme", scheme]
-                      resolve_res = run(resolve_cmd, timeout=1200)
-                      resolve_log = case_dir / f"02_resolve_packages_try{idx}.log"
-                      write_text(resolve_log, resolve_res["output"] + (("\nEXCEPTION:\n" + resolve_res["exception"]) if resolve_res["exception"] else ""))
-                      key_lines = extract_key_lines(resolve_res["output"])
+
+                  resolve_attempts = [
+                      {
+                          "name": "plain",
+                          "cmd": ["xcodebuild", "-resolvePackageDependencies", "-project", str(project), "-scheme", scheme],
+                      },
+                      {
+                          "name": "disableAutomaticResolution-no",
+                          "cmd": ["xcodebuild", "-resolvePackageDependencies", "-project", str(project), "-scheme", scheme, "-disableAutomaticPackageResolution", "NO"],
+                      },
+                  ]
+
+                  for idx, item in enumerate(resolve_attempts, start=1):
+                      resolve_cmd = item["cmd"]
+                      resolve_res = run(resolve_cmd, timeout=1800)
+                      resolve_output = resolve_res["output"] + (("\nEXCEPTION:\n" + resolve_res["exception"]) if resolve_res["exception"] else "")
+                      resolve_log = case_dir / f"02_resolve_packages_{item['name']}.log"
+                      write_text(resolve_log, resolve_output)
+                      key_lines = extract_key_lines(resolve_output)
+
                       attempts.append({
                           "phase": "resolvePackageDependencies",
                           "action": "resolve",
                           "destination": "",
                           "status": "passed" if resolve_res["ok"] else "failed",
-                          "seconds": resolve_res["seconds"],
                           "returncode": resolve_res["returncode"],
+                          "seconds": resolve_res["seconds"],
                           "log": str(resolve_log),
                           "key_lines": key_lines,
                           "command": format_command(resolve_cmd),
                       })
-                      resolve_best_lines = key_lines or resolve_best_lines
+
+                      if key_lines and not resolve_best_lines:
+                          resolve_best_lines = key_lines
+
                       if resolve_res["ok"]:
                           resolve_ok = True
                           break
 
-                  # Phase 3/4: build and test with fallback destinations
-                  wanted_actions = choose_actions(scheme)
-                  winning_destination = None
+                  destinations = build_destination_candidates(scheme, runtime_map)
+                  write_text(case_dir / "02_destination_candidates.json", json.dumps(destinations, indent=2))
+
                   final_status = "failed"
-                  final_action = None
+                  final_action = "build"
                   final_key_lines = []
-                  main_log = None
+                  winning_destination = None
+                  main_log = ""
+                  build_succeeded = False
 
-                  for action in wanted_actions:
-                      action_passed = False
-                      for dest in prioritized_destinations(scheme):
-                          # retry each destination once if it fails
-                          for idx in range(1, 3):
-                              log_name = f"03_{action}_{sanitize(dest)}_try{idx}.log"
-                              log_path = case_dir / log_name
-                              cmd = [
-                                  "xcodebuild",
-                                  "-project", str(project),
-                                  "-scheme", scheme,
-                                  "-destination", dest,
-                                  "clean",
-                                  action,
-                              ]
-                              res = run(cmd, timeout=3600)
-                              full_output = res["output"] + (("\nEXCEPTION:\n" + res["exception"]) if res["exception"] else "")
-                              write_text(log_path, full_output)
-                              key_lines = extract_key_lines(full_output)
+                  # Phase 3: build, exhaustive destination attempts
+                  for dest_index, dest in enumerate(destinations, start=1):
+                      for try_no in range(1, 3):
+                          build_cmd = [
+                              "xcodebuild",
+                              "-project", str(project),
+                              "-scheme", scheme,
+                              "-destination", dest,
+                              "clean",
+                              "build",
+                          ]
+                          build_log = case_dir / f"03_build_dest{dest_index:03d}_try{try_no}.log"
+                          build_res = run(build_cmd, timeout=5400)
+                          build_output = build_res["output"] + (("\nEXCEPTION:\n" + build_res["exception"]) if build_res["exception"] else "")
+                          write_text(build_log, build_output)
+                          key_lines = extract_key_lines(build_output)
 
-                              status = "passed" if res["ok"] else "failed"
-                              attempts.append({
-                                  "phase": action,
-                                  "action": action,
-                                  "destination": dest,
-                                  "status": status,
-                                  "seconds": res["seconds"],
-                                  "returncode": res["returncode"],
-                                  "log": str(log_path),
-                                  "key_lines": key_lines,
-                                  "command": format_command(cmd),
-                              })
+                          attempts.append({
+                              "phase": "build",
+                              "action": "build",
+                              "destination": dest,
+                              "status": "passed" if build_res["ok"] else "failed",
+                              "returncode": build_res["returncode"],
+                              "seconds": build_res["seconds"],
+                              "log": str(build_log),
+                              "key_lines": key_lines,
+                              "command": format_command(build_cmd),
+                          })
 
-                              if res["ok"]:
-                                  action_passed = True
-                                  winning_destination = dest
-                                  final_status = "passed"
-                                  final_action = action
-                                  final_key_lines = key_lines
-                                  main_log = str(log_path)
-                                  break
-
-                              if not final_key_lines and key_lines:
-                                  final_key_lines = key_lines
-                                  main_log = str(log_path)
-
-                              # If destination clearly invalid, move on to next destination quickly after first try
-                              invalid_dest = any(
-                                  "Unable to find a destination matching" in k or "Ineligible destinations" in k
-                                  for k in key_lines
-                              )
-                              if invalid_dest:
-                                  break
-
-                          if action_passed:
+                          if build_res["ok"]:
+                              build_succeeded = True
+                              final_status = "passed"
+                              final_action = "build"
+                              winning_destination = dest
+                              main_log = str(build_log)
+                              final_key_lines = key_lines
                               break
 
-                      if action_passed:
-                          # If build passes, still try test; if test fails, preserve test as final action/status
-                          if action == "build":
-                              continue
+                          if not final_key_lines and key_lines:
+                              final_key_lines = key_lines
+                              main_log = str(build_log)
+
+                          clearly_bad_destination = any(
+                              ("Unable to find a destination matching" in k) or ("Ineligible destinations" in k)
+                              for k in key_lines
+                          )
+                          if clearly_bad_destination:
+                              break
+
+                      if build_succeeded:
                           break
-                      else:
-                          final_status = "failed"
-                          final_action = action
 
-                          # If build itself fails, skip test only if no destination worked for build at all.
-                          if action == "build":
+                  # Phase 4: test, only if build succeeded
+                  if build_succeeded and winning_destination:
+                      for try_no in range(1, 3):
+                          test_cmd = [
+                              "xcodebuild",
+                              "-project", str(project),
+                              "-scheme", scheme,
+                              "-destination", winning_destination,
+                              "test",
+                          ]
+                          test_log = case_dir / f"04_test_try{try_no}.log"
+                          test_res = run(test_cmd, timeout=5400)
+                          test_output = test_res["output"] + (("\nEXCEPTION:\n" + test_res["exception"]) if test_res["exception"] else "")
+                          write_text(test_log, test_output)
+                          key_lines = extract_key_lines(test_output)
+
+                          attempts.append({
+                              "phase": "test",
+                              "action": "test",
+                              "destination": winning_destination,
+                              "status": "passed" if test_res["ok"] else "failed",
+                              "returncode": test_res["returncode"],
+                              "seconds": test_res["seconds"],
+                              "log": str(test_log),
+                              "key_lines": key_lines,
+                              "command": format_command(test_cmd),
+                          })
+
+                          if test_res["ok"]:
+                              final_status = "passed"
+                              final_action = "test"
+                              main_log = str(test_log)
+                              if key_lines:
+                                  final_key_lines = key_lines
                               break
+                          else:
+                              final_status = "failed"
+                              final_action = "test"
+                              main_log = str(test_log)
+                              if key_lines:
+                                  final_key_lines = key_lines
 
                   if not final_key_lines:
                       final_key_lines = resolve_best_lines
 
-                  result = {
+                  results.append({
                       "case_name": case_name,
                       "project": str(project),
                       "scheme": scheme,
                       "attempts": attempts,
                       "winning_destination": winning_destination,
                       "final_status": final_status,
-                      "final_action": final_action or "build",
+                      "final_action": final_action,
                       "final_key_lines": final_key_lines,
-                      "main_log": main_log or "",
+                      "main_log": main_log,
                       "total_seconds": round(time.time() - case_started, 2),
-                  }
-                  results.append(result)
+                  })
 
           payload = {
+              "xcode_path": XCODE_PATH,
+              "runtime_map": runtime_map,
               "projects": projects_meta,
               "results": results,
           }
+
           write_text(SUMMARY_JSON, json.dumps(payload, indent=2))
-          write_summary(results, projects_meta)
+          write_summary(results, projects_meta, runtime_map)
 
           print("\n=== FINAL AGGREGATED SUMMARY ===\n")
           passed = 0
           failed = 0
+
           for r in results:
               if r["final_status"] == "passed":
                   passed += 1
@@ -506,14 +830,15 @@ jobs:
               else:
                   failed += 1
                   icon = "FAIL"
+
               print(f"[{icon}] {r['case_name']}")
-              print(f"  action     : {r['final_action']}")
-              print(f"  destination: {r['winning_destination']}")
-              print(f"  duration   : {r['total_seconds']:.2f}s")
-              print(f"  main log   : {r['main_log']}")
+              print(f"  Final action       : {r['final_action']}")
+              print(f"  Winning destination: {r['winning_destination']}")
+              print(f"  Duration           : {r['total_seconds']:.2f}s")
+              print(f"  Main log           : {r['main_log']}")
               if r["final_key_lines"]:
-                  print("  highlights :")
-                  for line in r["final_key_lines"][:8]:
+                  print("  Extracted lines    :")
+                  for line in r["final_key_lines"][:12]:
                       print(f"    - {line}")
               print()
 
@@ -525,7 +850,7 @@ jobs:
           sys.exit(1 if failed > 0 else 0)
           PY
 
-      - name: Upload exhaustive logs and summaries
+      - name: Upload exhaustive debug artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
