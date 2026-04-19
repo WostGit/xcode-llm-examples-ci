@@ -58,14 +58,12 @@ jobs:
             find . -maxdepth 3 \( -name "*.xcodeproj" -o -name "Package.swift" -o -name "*.xcworkspace" \) | sort || true
             echo '```'
           } | tee ci_results/meta/environment.md
-
           cat ci_results/meta/environment.md >> "$GITHUB_STEP_SUMMARY"
 
       - name: Run exhaustive suite
         shell: bash
         run: |
           set +e
-
           python3 - <<'PY'
           import json
           import os
@@ -78,7 +76,6 @@ jobs:
 
           ROOT = Path(".").resolve()
           OUT = ROOT / "ci_results"
-    files = ROOT")
           LOGS = OUT / "logs"
           META = OUT / "meta"
           LOGS.mkdir(parents=True, exist_ok=True)
@@ -237,22 +234,14 @@ jobs:
 
           def build_destinations(scheme, sim_names):
               info = classify_scheme(scheme)
-
-              mac = [
-                  "platform=macOS,arch=arm64",
-                  "platform=macOS",
-                  "generic/platform=macOS",
-              ]
+              mac = ["platform=macOS,arch=arm64", "platform=macOS", "generic/platform=macOS"]
               ios = []
               for osver in PREFERRED_IOS_RUNTIMES:
                   for name in sim_names:
                       ios.append(f"platform=iOS Simulator,OS={osver},name={name}")
               for name in sim_names:
                   ios.append(f"platform=iOS Simulator,name={name}")
-              ios.extend([
-                  "generic/platform=iOS Simulator",
-                  "generic/platform=iOS",
-              ])
+              ios.extend(["generic/platform=iOS Simulator", "generic/platform=iOS"])
 
               if info["likely_ios"] and not info["likely_macos"]:
                   candidates = ios + mac
@@ -295,8 +284,7 @@ jobs:
                       continue
                   if in_schemes:
                       if not line.strip():
-                          if schemes:
-                              break
+                          if schemes: break
                           continue
                       if line.startswith("        ") or line.startswith("    ") or line.startswith("\t"):
                           schemes.append(line.strip())
@@ -306,7 +294,6 @@ jobs:
 
           def discover_targets():
               targets = []
-
               xcode_projects = find_xcode_projects()
               package_swifts = find_package_swifts()
 
@@ -334,12 +321,9 @@ jobs:
                   res = run(list_cmd, timeout=300)
                   write_text(LOGS / f"{sanitize(pkg_dir.name)}_package_list.log", res["output"] + (("\nEXCEPTION:\n" + res["exception"]) if res["exception"] else ""))
                   schemes = parse_schemes_from_list_output(res["output"])
-
                   if not schemes:
-                      # Extra diagnostics for SwiftPM repos
                       dump_res = run(["swift", "package", "dump-package"], cwd=str(pkg_dir), timeout=300)
                       write_text(LOGS / f"{sanitize(pkg_dir.name)}_dump_package.log", dump_res["output"] + (("\nEXCEPTION:\n" + dump_res["exception"]) if dump_res["exception"] else ""))
-
                   for scheme in schemes:
                       targets.append({
                           "kind": "package",
@@ -349,7 +333,6 @@ jobs:
                           "scheme": scheme,
                           "label": f"{pkg_dir.name}::{scheme}",
                       })
-
               return targets
 
           def make_list_cmd(target):
@@ -389,13 +372,11 @@ jobs:
               sys.exit(1)
 
           results = []
-
           for target in targets:
               case_name = target["label"]
               case_slug = sanitize(case_name)
               case_dir = LOGS / case_slug
               case_dir.mkdir(parents=True, exist_ok=True)
-
               attempts = []
               case_started = time.time()
 
@@ -405,15 +386,9 @@ jobs:
               list_output = list_res["output"] + (("\nEXCEPTION:\n" + list_res["exception"]) if list_res["exception"] else "")
               write_text(case_dir / "00_list.log", list_output)
               attempts.append({
-                  "phase": "list",
-                  "action": "list",
-                  "destination": "",
-                  "status": "passed" if list_res["ok"] else "failed",
-                  "returncode": list_res["returncode"],
-                  "seconds": list_res["seconds"],
-                  "log": str(case_dir / "00_list.log"),
-                  "key_lines": extract_key_lines(list_output),
-                  "command": format_command(list_cmd),
+                  "phase": "list", "action": "list", "destination": "", "status": "passed" if list_res["ok"] else "failed",
+                  "returncode": list_res["returncode"], "seconds": list_res["seconds"], "log": str(case_dir / "00_list.log"),
+                  "key_lines": extract_key_lines(list_output), "command": format_command(list_cmd),
               })
 
               # showdestinations
@@ -422,15 +397,9 @@ jobs:
               show_output = show_res["output"] + (("\nEXCEPTION:\n" + show_res["exception"]) if show_res["exception"] else "")
               write_text(case_dir / "01_showdestinations.log", show_output)
               attempts.append({
-                  "phase": "showdestinations",
-                  "action": "showdestinations",
-                  "destination": "",
-                  "status": "passed" if show_res["ok"] else "failed",
-                  "returncode": show_res["returncode"],
-                  "seconds": show_res["seconds"],
-                  "log": str(case_dir / "01_showdestinations.log"),
-                  "key_lines": extract_key_lines(show_output),
-                  "command": format_command(show_cmd),
+                  "phase": "showdestinations", "action": "showdestinations", "destination": "", "status": "passed" if show_res["ok"] else "failed",
+                  "returncode": show_res["returncode"], "seconds": show_res["seconds"], "log": str(case_dir / "01_showdestinations.log"),
+                  "key_lines": extract_key_lines(show_output), "command": format_command(show_cmd),
               })
 
               # resolve
@@ -442,33 +411,19 @@ jobs:
                   log_path = case_dir / f"02_resolve_try{idx}.log"
                   write_text(log_path, resolve_output)
                   key_lines = extract_key_lines(resolve_output)
-
                   attempts.append({
-                      "phase": "resolvePackageDependencies",
-                      "action": "resolve",
-                      "destination": "",
-                      "status": "passed" if resolve_res["ok"] else "failed",
-                      "returncode": resolve_res["returncode"],
-                      "seconds": resolve_res["seconds"],
-                      "log": str(log_path),
-                      "key_lines": key_lines,
-                      "command": format_command(resolve_cmd),
+                      "phase": "resolvePackageDependencies", "action": "resolve", "destination": "", "status": "passed" if resolve_res["ok"] else "failed",
+                      "returncode": resolve_res["returncode"], "seconds": resolve_res["seconds"], "log": str(log_path),
+                      "key_lines": key_lines, "command": format_command(resolve_cmd),
                   })
-
-                  if key_lines and not resolve_best_lines:
-                      resolve_best_lines = key_lines
-                  if resolve_res["ok"]:
-                      break
+                  if key_lines and not resolve_best_lines: resolve_best_lines = key_lines
+                  if resolve_res["ok"]: break
 
               destinations = build_destinations(target["scheme"], sim_names)
               write_text(case_dir / "02_destination_candidates.json", json.dumps(destinations, indent=2))
 
-              final_status = "failed"
-              final_action = "build"
+              final_status, final_action, winning_destination, main_log, build_succeeded = "failed", "build", None, "", False
               final_key_lines = []
-              winning_destination = None
-              main_log = ""
-              build_succeeded = False
 
               for d_index, destination in enumerate(destinations, start=1):
                   for try_no in range(1, 3):
@@ -478,37 +433,19 @@ jobs:
                       log_path = case_dir / f"03_build_dest{d_index:03d}_try{try_no}.log"
                       write_text(log_path, build_output)
                       key_lines = extract_key_lines(build_output)
-
                       attempts.append({
-                          "phase": "build",
-                          "action": "build",
-                          "destination": destination,
-                          "status": "passed" if build_res["ok"] else "failed",
-                          "returncode": build_res["returncode"],
-                          "seconds": build_res["seconds"],
-                          "log": str(log_path),
-                          "key_lines": key_lines,
-                          "command": format_command(build_cmd),
+                          "phase": "build", "action": "build", "destination": destination, "status": "passed" if build_res["ok"] else "failed",
+                          "returncode": build_res["returncode"], "seconds": build_res["seconds"], "log": str(log_path),
+                          "key_lines": key_lines, "command": format_command(build_cmd),
                       })
-
                       if build_res["ok"]:
-                          build_succeeded = True
-                          final_status = "passed"
-                          final_action = "build"
-                          winning_destination = destination
-                          main_log = str(log_path)
-                          final_key_lines = key_lines
+                          build_succeeded, final_status, winning_destination, main_log, final_key_lines = True, "passed", destination, str(log_path), key_lines
                           break
-
                       if not final_key_lines and key_lines:
-                          final_key_lines = key_lines
-                          main_log = str(log_path)
-
+                          final_key_lines, main_log = key_lines, str(log_path)
                       if any(("Unable to find a destination matching" in k) or ("Ineligible destinations" in k) for k in key_lines):
                           break
-
-                  if build_succeeded:
-                      break
+                  if build_succeeded: break
 
               if build_succeeded and winning_destination:
                   for try_no in range(1, 3):
@@ -518,137 +455,40 @@ jobs:
                       log_path = case_dir / f"04_test_try{try_no}.log"
                       write_text(log_path, test_output)
                       key_lines = extract_key_lines(test_output)
-
                       attempts.append({
-                          "phase": "test",
-                          "action": "test",
-                          "destination": winning_destination,
-                          "status": "passed" if test_res["ok"] else "failed",
-                          "returncode": test_res["returncode"],
-                          "seconds": test_res["seconds"],
-                          "log": str(log_path),
-                          "key_lines": key_lines,
-                          "command": format_command(test_cmd),
+                          "phase": "test", "action": "test", "destination": winning_destination, "status": "passed" if test_res["ok"] else "failed",
+                          "returncode": test_res["returncode"], "seconds": test_res["seconds"], "log": str(log_path),
+                          "key_lines": key_lines, "command": format_command(test_cmd),
                       })
-
                       if test_res["ok"]:
-                          final_status = "passed"
-                          final_action = "test"
-                          main_log = str(log_path)
-                          if key_lines:
-                              final_key_lines = key_lines
+                          final_status, final_action, main_log = "passed", "test", str(log_path)
+                          if key_lines: final_key_lines = key_lines
                           break
                       else:
-                          final_status = "failed"
-                          final_action = "test"
-                          main_log = str(log_path)
-                          if key_lines:
-                              final_key_lines = key_lines
+                          final_status, final_action, main_log = "failed", "test", str(log_path)
+                          if key_lines: final_key_lines = key_lines
 
-              if not final_key_lines:
-                  final_key_lines = resolve_best_lines
-
+              if not final_key_lines: final_key_lines = resolve_best_lines
               results.append({
-                  "case_name": case_name,
-                  "kind": target["kind"],
-                  "project": target["project"],
-                  "package_path": target["package_path"],
-                  "scheme": target["scheme"],
-                  "attempts": attempts,
-                  "winning_destination": winning_destination,
-                  "final_status": final_status,
-                  "final_action": final_action,
-                  "final_key_lines": final_key_lines,
-                  "main_log": main_log,
-                  "total_seconds": round(time.time() - case_started, 2),
+                  "case_name": case_name, "kind": target["kind"], "project": target["project"], "package_path": target["package_path"],
+                  "scheme": target["scheme"], "attempts": attempts, "winning_destination": winning_destination,
+                  "final_status": final_status, "final_action": final_action, "final_key_lines": final_key_lines,
+                  "main_log": main_log, "total_seconds": round(time.time() - case_started, 2),
               })
 
-          payload = {
-              "targets": targets,
-              "results": results,
-          }
+          payload = {"targets": targets, "results": results}
           write_text(SUMMARY_JSON, json.dumps(payload, indent=2))
-
-          lines = []
-          lines.append("# Exhaustive Xcode Debug Summary")
-          lines.append("")
-          lines.append(f"- Targets discovered: **{len(targets)}**")
-          lines.append(f"- iOS simulators discovered: **{len(sim_names)}**")
-          lines.append("")
-          lines.append("| Case | Kind | Final status | Final action | Winning destination | Duration (s) | Top issue |")
-          lines.append("|---|---|---|---|---|---:|---|")
-
-          passed = 0
-          failed = 0
+          lines = ["# Exhaustive Xcode Debug Summary", "", f"- Targets discovered: **{len(targets)}**", f"- iOS simulators discovered: **{len(sim_names)}**", "", "| Case | Kind | Final status | Final action | Winning destination | Duration (s) | Top issue |", "|---|---|---|---|---|---:|---|"]
+          passed = failed = 0
           for r in results:
-              if r["final_status"] == "passed":
-                  passed += 1
-              else:
-                  failed += 1
+              if r["final_status"] == "passed": passed += 1
+              else: failed += 1
               top_issue = r["final_key_lines"][0].replace("|", "\\|") if r["final_key_lines"] else ""
-              lines.append(
-                  f"| {r['case_name']} | {r['kind']} | {r['final_status']} | {r['final_action']} | "
-                  f"{(r['winning_destination'] or '').replace('|', '/')} | {r['total_seconds']:.2f} | {top_issue} |"
-              )
-
-          lines.append("")
-          lines.append(f"- Passed: **{passed}**")
-          lines.append(f"- Failed: **{failed}**")
-          lines.append("")
-
-          for r in results:
-              lines.append(f"## {r['case_name']}")
-              lines.append("")
-              lines.append(f"- Kind: `{r['kind']}`")
-              lines.append(f"- Scheme: `{r['scheme']}`")
-              if r["project"]:
-                  lines.append(f"- Project: `{r['project']}`")
-              if r["package_path"]:
-                  lines.append(f"- Package path: `{r['package_path']}`")
-              lines.append(f"- Final status: **{r['final_status']}**")
-              lines.append(f"- Final action: `{r['final_action']}`")
-              lines.append(f"- Winning destination: `{r['winning_destination']}`")
-              lines.append(f"- Main log: `{r['main_log']}`")
-              lines.append("")
-              lines.append("### Key lines")
-              if r["final_key_lines"]:
-                  for item in r["final_key_lines"][:15]:
-                      lines.append(f"- {item}")
-              else:
-                  lines.append("- None")
-              lines.append("")
-              lines.append("### Attempts")
-              for a in r["attempts"]:
-                  lines.append(f"- `{a['phase']}` / `{a['action']}` / `{a['destination']}` -> `{a['status']}` in `{a['seconds']:.2f}s`")
-                  lines.append(f"  - Command: `{a['command']}`")
-                  lines.append(f"  - Log: `{a['log']}`")
-              lines.append("")
+              lines.append(f"| {r['case_name']} | {r['kind']} | {r['final_status']} | {r['final_action']} | {(r['winning_destination'] or '').replace('|', '/')} | {r['total_seconds']:.2f} | {top_issue} |")
 
           summary_md = "\n".join(lines) + "\n"
           write_text(SUMMARY_MD, summary_md)
-          if STEP_SUMMARY:
-              append_text(Path(STEP_SUMMARY), summary_md)
-
-          print("\n=== FINAL AGGREGATED SUMMARY ===\n")
-          for r in results:
-              icon = "PASS" if r["final_status"] == "passed" else "FAIL"
-              print(f"[{icon}] {r['case_name']}")
-              print(f"  kind               : {r['kind']}")
-              print(f"  final action       : {r['final_action']}")
-              print(f"  winning destination: {r['winning_destination']}")
-              print(f"  duration           : {r['total_seconds']:.2f}s")
-              print(f"  main log           : {r['main_log']}")
-              if r["final_key_lines"]:
-                  print("  extracted lines    :")
-                  for line in r["final_key_lines"][:12]:
-                      print(f"    - {line}")
-              print()
-
-          print("=== TOTALS ===")
-          print(f"passed: {passed}")
-          print(f"failed: {failed}")
-          print(f"total : {len(results)}")
-
+          if STEP_SUMMARY: append_text(Path(STEP_SUMMARY), summary_md)
           sys.exit(1 if failed > 0 else 0)
           PY
 
